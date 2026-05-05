@@ -5,14 +5,17 @@
  * @brief Real-time audio mixing/routing engine for CrossPad PC.
  *
  * Routes 3 inputs (IN1, IN2, Synth) to 2 outputs (OUT1, OUT2) with per-route
- * volume, per-channel mute/solo, and peak level metering. Runs on a dedicated
- * thread — always active as the main audio pipeline.
+ * volume, per-channel mute/solo, and peak level metering.
+ *
+ * Driven synchronously from the IAudioModule pipeline thread via render() —
+ * single-writer guarantees the synth's FmSynth state is touched only from
+ * one thread, eliminating the distortion seen with the legacy mixer thread.
  */
 
 #include <atomic>
 #include <cstdint>
-#include <thread>
 #include <string>
+#include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
 
 static constexpr int MIXER_NUM_INPUTS  = 3;  // IN1, IN2, SYNTH
@@ -55,9 +58,17 @@ public:
     AudioMixerEngine() = default;
     ~AudioMixerEngine();
 
-    void start();
-    void stop();
-    bool isRunning() const { return running_.load(); }
+    /// Synchronously render `frames` of stereo audio into out0/out1 float buffers
+    /// in [-1.0, 1.0]. Must be called from a single thread. Pulls IN1/IN2 from
+    /// pc_platform_get_audio_input, renders the synth via ISynthEngine::process,
+    /// applies channel gain/mute/solo, route matrix, and per-output volume.
+    void render(float* out0, float* out1, uint32_t frames);
+
+    /// Legacy thread-based driver — now no-ops kept for ABI/UI compatibility.
+    /// Driving is done by IAudioModule pipeline calling render().
+    void start() {}
+    void stop()  {}
+    bool isRunning() const { return true; }
 
     // Route matrix
     void setRouteEnabled(MixerInput in, MixerOutput out, bool enabled);
@@ -105,11 +116,14 @@ private:
     MixerChannel   channels_[MIXER_NUM_INPUTS];
     MixerOutputBus outputs_[MIXER_NUM_OUTPUTS];
 
-    std::atomic<bool> running_{false};
     std::atomic<crosspad::AudioRingBuffer<int16_t>*> tapBuffer_{nullptr};
     std::atomic<uint8_t> tapOutput_{0};  // MixerOutput::OUT1
 
-    void mixerThreadFunc();
+    // Render-time scratch (sized lazily on first render call).
+    std::vector<float>   inFloatBuf_[MIXER_NUM_INPUTS];   // interleaved stereo float
+    std::vector<int16_t> inInt16Buf_[MIXER_NUM_INPUTS - 1]; // IN1/IN2 raw read buffer
+    std::vector<int16_t> tapBuf_;
+    bool sampleRateLogged_ = false;
 };
 
 /// Global mixer engine accessor (initialized in crosspad_app.cpp)
