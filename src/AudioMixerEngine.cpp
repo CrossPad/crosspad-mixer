@@ -1,43 +1,24 @@
 /**
  * @file AudioMixerEngine.cpp
- * @brief Real-time audio mixer thread implementation.
+ * @brief Audio mixer rendering — synchronous driver from IAudioModule pipeline.
  */
 
 #include "AudioMixerEngine.hpp"
 
 #include "pc_stubs/pc_platform.h"
-#include "audio/PcAudio.hpp"
-#include "audio/PcAudioInput.hpp"
 #include "synth/MlPianoSynth.hpp"
+#include "crosspad/synth/IAudioInput.hpp"
+#include "crosspad/synth/ISynthEngine.hpp"
 
 #include <ArduinoJson.h>
 
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
-#include <chrono>
 #include <vector>
 #include <fstream>
 
-AudioMixerEngine::~AudioMixerEngine()
-{
-    stop();
-}
-
-void AudioMixerEngine::start()
-{
-    if (running_.load()) return;
-
-    running_.store(true);
-    std::thread(&AudioMixerEngine::mixerThreadFunc, this).detach();
-}
-
-void AudioMixerEngine::stop()
-{
-    if (!running_.load()) return;
-    running_.store(false);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-}
+AudioMixerEngine::~AudioMixerEngine() = default;
 
 // ── Route matrix ──
 
@@ -154,211 +135,130 @@ static void computePeak(const int16_t* buf, uint32_t frames,
     peakR.store(maxR, std::memory_order_relaxed);
 }
 
-// ── Mixer thread ──
+// ── Synchronous render API (driven by IAudioModule pipeline) ──
 
-void AudioMixerEngine::mixerThreadFunc()
+void AudioMixerEngine::render(float* out0, float* out1, uint32_t frames)
 {
-    constexpr uint32_t CHUNK = MIXER_CHUNK_FRAMES;
-    constexpr uint32_t STEREO_SAMPLES = CHUNK * 2;
+    const uint32_t stereo = frames * 2;
 
-    // Input buffers (interleaved int16 stereo)
-    std::vector<int16_t> inBuf[MIXER_NUM_INPUTS];
-    for (auto& b : inBuf) b.resize(STEREO_SAMPLES, 0);
+    // Lazy scratch alloc
+    for (auto& b : inFloatBuf_) {
+        if (b.size() < stereo) b.assign(stereo, 0.0f);
+    }
+    for (auto& b : inInt16Buf_) {
+        if (b.size() < stereo) b.assign(stereo, 0);
+    }
 
-    // Output accumulation buffers (int32 to avoid clipping during sum)
-    std::vector<int32_t> outAccum[MIXER_NUM_OUTPUTS];
-    for (auto& b : outAccum) b.resize(STEREO_SAMPLES, 0);
+    // ── 1. Pull inputs ──
+    auto pullInput = [&](uint8_t idx) {
+        crosspad::IAudioInput* in = pc_platform_get_audio_input(idx);
+        auto& i16 = inInt16Buf_[idx];
+        auto& f   = inFloatBuf_[idx];
+        if (!in) {
+            std::memset(f.data(), 0, stereo * sizeof(float));
+            return;
+        }
+        uint32_t got = in->read(i16.data(), frames);
+        if (got < frames) {
+            std::memset(i16.data() + got * 2, 0, (frames - got) * 2 * sizeof(int16_t));
+        }
+        constexpr float kInt16ToFloat = 1.0f / 32768.0f;
+        for (uint32_t i = 0; i < stereo; ++i) f[i] = i16[i] * kInt16ToFloat;
+    };
+    pullInput(0); // IN1
+    pullInput(1); // IN2
 
-    // Final output buffer
-    std::vector<int16_t> outBuf(STEREO_SAMPLES, 0);
-
-    printf("[Mixer] Audio mixer thread started\n");
-    fflush(stdout);
-
-    // Determine chunk duration for pacing.
-    // Default to 48000 Hz if no output is open yet.
-    uint32_t sampleRate = 48000;
-    auto* pOut = pc_platform_get_audio_output(0);
-    if (pOut && pOut->isOpen() && pOut->getSampleRate() > 0)
-        sampleRate = pOut->getSampleRate();
-    const auto chunkDuration = std::chrono::microseconds(
-        (uint64_t)CHUNK * 1000000 / sampleRate);
-
-    // Drain stale input data accumulated before mixer started
+    // SYNTH — render directly as float
     {
-        int16_t junk[512];
-        for (int idx = 0; idx < 2; idx++) {
-            auto* in = pc_platform_get_audio_input(idx);
-            if (in) {
-                while (in->read(junk, 256) > 0) {}
-            }
-        }
-    }
-
-    // Check for sample rate mismatches between inputs and outputs
-    auto* audioIn1 = pc_platform_get_audio_input(0);
-    auto* audioIn2 = pc_platform_get_audio_input(1);
-    if (audioIn1 && static_cast<PcAudioInput*>(audioIn1)->isOpen()) {
-        uint32_t inRate = audioIn1->getSampleRate();
-        if (inRate != sampleRate)
-            printf("[Mixer] WARNING: IN1 rate %u Hz != output rate %u Hz\n", inRate, sampleRate);
-    }
-    if (audioIn2 && static_cast<PcAudioInput*>(audioIn2)->isOpen()) {
-        uint32_t inRate = audioIn2->getSampleRate();
-        if (inRate != sampleRate)
-            printf("[Mixer] WARNING: IN2 rate %u Hz != output rate %u Hz\n", inRate, sampleRate);
-    }
-
-    while (running_.load()) {
-        auto iterStart = std::chrono::steady_clock::now();
-
-        // ── 1. Read inputs ──
-
-        // IN1
-        auto* audioIn1 = pc_platform_get_audio_input(0);
-        if (audioIn1) {
-            auto* pcIn = static_cast<PcAudioInput*>(audioIn1);
-            uint32_t got = pcIn->read(inBuf[0].data(), CHUNK);
-            if (got < CHUNK) {
-                std::memset(inBuf[0].data() + got * 2, 0,
-                            (CHUNK - got) * 2 * sizeof(int16_t));
-            }
+        crosspad::ISynthEngine* synth = pc_platform_get_synth_engine();
+        auto& f = inFloatBuf_[(int)MixerInput::SYNTH];
+        if (synth) {
+            synth->process(f.data(), frames);
         } else {
-            std::memset(inBuf[0].data(), 0, STEREO_SAMPLES * sizeof(int16_t));
-        }
-
-        // IN2
-        auto* audioIn2 = pc_platform_get_audio_input(1);
-        if (audioIn2) {
-            auto* pcIn = static_cast<PcAudioInput*>(audioIn2);
-            uint32_t got = pcIn->read(inBuf[1].data(), CHUNK);
-            if (got < CHUNK) {
-                std::memset(inBuf[1].data() + got * 2, 0,
-                            (CHUNK - got) * 2 * sizeof(int16_t));
-            }
-        } else {
-            std::memset(inBuf[1].data(), 0, STEREO_SAMPLES * sizeof(int16_t));
-        }
-
-        // SYNTH
-        auto* synthEngine = pc_platform_get_synth_engine();
-        if (synthEngine) {
-            auto* synth = static_cast<MlPianoSynth*>(synthEngine);
-            synth->process(inBuf[2].data(), CHUNK);
-        } else {
-            std::memset(inBuf[2].data(), 0, STEREO_SAMPLES * sizeof(int16_t));
-        }
-
-        // ── 2. Compute per-channel peaks ──
-        for (int ch = 0; ch < MIXER_NUM_INPUTS; ch++) {
-            computePeak(inBuf[ch].data(), CHUNK,
-                        channels_[ch].peakL, channels_[ch].peakR);
-        }
-
-        // ── 3. Solo logic ──
-        bool anySoloed = isAnySoloed();
-
-        // ── 4. Clear output accumulators ──
-        for (auto& b : outAccum) {
-            std::memset(b.data(), 0, STEREO_SAMPLES * sizeof(int32_t));
-        }
-
-        // ── 5. Route and mix ──
-        for (int ch = 0; ch < MIXER_NUM_INPUTS; ch++) {
-            bool muted = channels_[ch].muted.load(std::memory_order_relaxed);
-            bool solo  = channels_[ch].soloed.load(std::memory_order_relaxed);
-
-            // Skip this channel if muted, or if solo mode is active and this isn't soloed
-            if (muted) continue;
-            if (anySoloed && !solo) continue;
-
-            float chVol = channels_[ch].volume.load(std::memory_order_relaxed);
-
-            for (int out = 0; out < MIXER_NUM_OUTPUTS; out++) {
-                if (!routes_[ch][out].enabled.load(std::memory_order_relaxed))
-                    continue;
-
-                float routeVol = routes_[ch][out].volume.load(std::memory_order_relaxed);
-                float gain = chVol * routeVol;
-
-                // Fixed-point gain: gain * 256
-                int32_t gainFP = static_cast<int32_t>(gain * 256.0f);
-
-                for (uint32_t s = 0; s < STEREO_SAMPLES; s++) {
-                    outAccum[out][s] += (static_cast<int32_t>(inBuf[ch][s]) * gainFP) >> 8;
-                }
-            }
-        }
-
-        // ── 6. Apply output volume, clamp, write ──
-        for (int out = 0; out < MIXER_NUM_OUTPUTS; out++) {
-            bool outMuted = outputs_[out].muted.load(std::memory_order_relaxed);
-            float outVol  = outputs_[out].volume.load(std::memory_order_relaxed);
-            int32_t outGainFP = static_cast<int32_t>(outVol * 256.0f);
-
-            int16_t maxL = 0, maxR = 0;
-
-            for (uint32_t i = 0; i < CHUNK; i++) {
-                int32_t sL = outMuted ? 0 : (outAccum[out][i * 2]     * outGainFP) >> 8;
-                int32_t sR = outMuted ? 0 : (outAccum[out][i * 2 + 1] * outGainFP) >> 8;
-
-                // Clamp to int16 range
-                if (sL > 32767)  sL = 32767;
-                if (sL < -32768) sL = -32768;
-                if (sR > 32767)  sR = 32767;
-                if (sR < -32768) sR = -32768;
-
-                outBuf[i * 2]     = static_cast<int16_t>(sL);
-                outBuf[i * 2 + 1] = static_cast<int16_t>(sR);
-
-                int16_t absL = sL < 0 ? (int16_t)-sL : (int16_t)sL;
-                int16_t absR = sR < 0 ? (int16_t)-sR : (int16_t)sR;
-                if (absL > maxL) maxL = absL;
-                if (absR > maxR) maxR = absR;
-            }
-
-            outputs_[out].peakL.store(maxL, std::memory_order_relaxed);
-            outputs_[out].peakR.store(maxR, std::memory_order_relaxed);
-
-            // Write to audio output — wait for ring space (paced by output callback)
-            auto* pcOut = pc_platform_get_audio_output(out);
-            if (pcOut && pcOut->isOpen()) {
-                uint32_t offset = 0;
-                uint32_t remaining = CHUNK;
-                int retries = 0;
-                while (remaining > 0 && running_.load()) {
-                    uint32_t written = pcOut->write(outBuf.data() + offset * 2, remaining);
-                    offset += written;
-                    remaining -= written;
-                    if (remaining > 0) {
-                        // Output ring full — wait for callback to drain it.
-                        // Use short sleep (1ms) — output callback runs every ~5ms.
-                        std::this_thread::sleep_for(std::chrono::microseconds(500));
-                        if (++retries > 20) break; // safety: don't block forever
-                    }
-                }
-            }
-
-            // Write to tap buffer (for CI audio capture)
-            if (out == tapOutput_.load(std::memory_order_relaxed)) {
-                auto* tap = tapBuffer_.load(std::memory_order_relaxed);
-                if (tap) {
-                    tap->write(outBuf.data(), STEREO_SAMPLES);
-                }
-            }
-        }
-
-        // ── 7. Pace to real-time (fallback if no output provided backpressure) ──
-        auto elapsed = std::chrono::steady_clock::now() - iterStart;
-        auto minChunkTime = std::chrono::microseconds(
-            (uint64_t)CHUNK * 1000000 / sampleRate / 2); // half chunk time minimum
-        if (elapsed < minChunkTime) {
-            std::this_thread::sleep_for(minChunkTime - elapsed);
+            std::memset(f.data(), 0, stereo * sizeof(float));
         }
     }
 
-    printf("[Mixer] Audio mixer thread exited\n");
+    // ── 2. Per-channel peaks (float → int16-equivalent for UI) ──
+    for (int ch = 0; ch < MIXER_NUM_INPUTS; ++ch) {
+        const auto& f = inFloatBuf_[ch];
+        float maxL = 0.0f, maxR = 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            float l = f[i * 2 + 0]; if (l < 0) l = -l;
+            float r = f[i * 2 + 1]; if (r < 0) r = -r;
+            if (l > maxL) maxL = l;
+            if (r > maxR) maxR = r;
+        }
+        channels_[ch].peakL.store(static_cast<int16_t>(maxL * 32767.0f), std::memory_order_relaxed);
+        channels_[ch].peakR.store(static_cast<int16_t>(maxR * 32767.0f), std::memory_order_relaxed);
+    }
+
+    // ── 3. Solo logic ──
+    const bool anySoloed = isAnySoloed();
+
+    // ── 4. Clear output buses ──
+    std::memset(out0, 0, stereo * sizeof(float));
+    std::memset(out1, 0, stereo * sizeof(float));
+    float* outBuses[MIXER_NUM_OUTPUTS] = { out0, out1 };
+
+    // ── 5. Route + mix ──
+    for (int ch = 0; ch < MIXER_NUM_INPUTS; ++ch) {
+        if (channels_[ch].muted.load(std::memory_order_relaxed)) continue;
+        const bool solo = channels_[ch].soloed.load(std::memory_order_relaxed);
+        if (anySoloed && !solo) continue;
+
+        const float chVol = channels_[ch].volume.load(std::memory_order_relaxed);
+        const auto& f = inFloatBuf_[ch];
+
+        for (int o = 0; o < MIXER_NUM_OUTPUTS; ++o) {
+            if (!routes_[ch][o].enabled.load(std::memory_order_relaxed)) continue;
+            const float gain = chVol * routes_[ch][o].volume.load(std::memory_order_relaxed);
+            float* dst = outBuses[o];
+            for (uint32_t s = 0; s < stereo; ++s) dst[s] += f[s] * gain;
+        }
+    }
+
+    // ── 6. Apply output volume + clamp + level meter + tap ──
+    for (int o = 0; o < MIXER_NUM_OUTPUTS; ++o) {
+        const bool muted = outputs_[o].muted.load(std::memory_order_relaxed);
+        const float outVol = outputs_[o].volume.load(std::memory_order_relaxed);
+        float* dst = outBuses[o];
+
+        float maxL = 0.0f, maxR = 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            float l = muted ? 0.0f : dst[i * 2 + 0] * outVol;
+            float r = muted ? 0.0f : dst[i * 2 + 1] * outVol;
+            if (l >  1.0f) l =  1.0f; if (l < -1.0f) l = -1.0f;
+            if (r >  1.0f) r =  1.0f; if (r < -1.0f) r = -1.0f;
+            dst[i * 2 + 0] = l;
+            dst[i * 2 + 1] = r;
+            float aL = l < 0 ? -l : l;
+            float aR = r < 0 ? -r : r;
+            if (aL > maxL) maxL = aL;
+            if (aR > maxR) maxR = aR;
+        }
+        outputs_[o].peakL.store(static_cast<int16_t>(maxL * 32767.0f), std::memory_order_relaxed);
+        outputs_[o].peakR.store(static_cast<int16_t>(maxR * 32767.0f), std::memory_order_relaxed);
+    }
+
+    // ── 7. Tap (CI capture) — int16 conversion of the configured output ──
+    auto* tap = tapBuffer_.load(std::memory_order_relaxed);
+    if (tap) {
+        const uint8_t tapO = tapOutput_.load(std::memory_order_relaxed);
+        if (tapO < MIXER_NUM_OUTPUTS) {
+            if (tapBuf_.size() < stereo) tapBuf_.assign(stereo, 0);
+            const float* src = outBuses[tapO];
+            for (uint32_t i = 0; i < stereo; ++i) {
+                float v = src[i] * 32767.0f;
+                if (v >  32767.0f) v =  32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                tapBuf_[i] = static_cast<int16_t>(v);
+            }
+            tap->write(tapBuf_.data(), stereo);
+        }
+    }
 }
+
 
 // ── Defaults ──
 
