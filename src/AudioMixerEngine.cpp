@@ -38,6 +38,11 @@ void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t n
     const uint32_t stereoSamples = frameCount * 2;
     for (auto& slot : channels_) {
         if (slot.scratch.size() < stereoSamples) slot.scratch.resize(stereoSamples);
+        // Propagate the new buffer-size + SR to already-registered channel
+        // nodes so they can pre-size their own scratch (RT-safe contract).
+        if (slot.active.load(std::memory_order_acquire) && slot.node) {
+            slot.node->onPrepare(frameCount, sampleRate);
+        }
     }
 }
 
@@ -96,6 +101,14 @@ AudioMixerEngine::addChannel(crosspad::IAudioNode* node, const char* name) {
 
         const uint32_t stereoSamples = frameCount_ * 2;
         if (slot.scratch.size() < stereoSamples) slot.scratch.resize(stereoSamples);
+
+        // Hand the node the buffer size + SR so it can pre-allocate before
+        // the render thread ever calls mix(). If setup() hasn't run yet,
+        // frameCount_ is 0 — render() can't fire either, so skip the call;
+        // the node will be prepared on the next setup().
+        if (frameCount_ > 0 && node) {
+            node->onPrepare(frameCount_, sampleRate_);
+        }
 
         slot.active.store(true, std::memory_order_release);
         return i;
