@@ -15,6 +15,8 @@ idf_component_register(
         crosspad-gui
         lvgl
         ArduinoJson
+    PRIV_REQUIRES
+        espressif__esp-dsp
 )
 
 # WHOLE_ARCHIVE keeps the REGISTER_APP-generated _register_Mixer_app() symbol

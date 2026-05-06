@@ -8,6 +8,13 @@
 #include <crosspad/audio/IAudioNode.hpp>
 #include <crosspad/audio/AudioFormatConvert.hpp>
 
+#if defined(CROSSPAD_USE_ESP_DSP) && __has_include(<esp_dsp.h>)
+  #include <esp_dsp.h>
+  #define CROSSPAD_MIXER_USE_ESP_DSP 1
+#else
+  #define CROSSPAD_MIXER_USE_ESP_DSP 0
+#endif
+
 #include <ArduinoJson.h>
 
 #include <cstdio>
@@ -44,6 +51,9 @@ void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t n
             slot.node->onPrepare(frameCount, sampleRate);
         }
     }
+    // Render hot path uses this for the (channel × gain) product before
+    // accumulating into the output bus (esp-dsp two-pass MAC). Sized once.
+    if (mixScratch_.size() < stereoSamples) mixScratch_.assign(stereoSamples, 0.0f);
 }
 
 void AudioMixerEngine::resetChannelSlot(ChannelSlot& s) {
@@ -303,6 +313,16 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     }
 
     // 4. Route + mix
+    //
+    // Per (ch, out): out[s] += slot.scratch[s] * gain   (stereo-interleaved)
+    //
+    // esp-dsp on Xtensa LX7 has no fused MAC for float, so the optimised
+    // path is two passes over the buffer:
+    //   dsps_mulc_f32: mixScratch_ = src * gain
+    //   dsps_add_f32 : dst         = dst + mixScratch_
+    // For sub-1-KiB stereo buffers (typical: 64..256 frames = 256..1024 B)
+    // both passes stay in L1, so the win comes from the hand-tuned LX7
+    // FPU loops vs the C compiler's auto-vectoriser.
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
         if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
@@ -316,19 +336,40 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             if (!slot.routeEnabled[o].load(std::memory_order_relaxed)) continue;
             const float gain = chVol * slot.routeVol[o].load(std::memory_order_relaxed);
             float* dst = outBuses[o];
+#if CROSSPAD_MIXER_USE_ESP_DSP
+            float* tmp = mixScratch_.data();
+            dsps_mulc_f32(src, tmp, stereo, gain, 1, 1);
+            dsps_add_f32 (dst, tmp, dst, stereo, 1, 1, 1);
+#else
             for (uint32_t s = 0; s < stereo; ++s) dst[s] += src[s] * gain;
+#endif
         }
     }
 
     // 5. Per-output volume + clamp + meter
+    //
+    // dsps_mulc_f32 runs in-place to apply the master output gain, then a
+    // scalar pass handles clamp + peak tracking (esp-dsp has no clamp/abs-
+    // max helper that fits this layout, and the scalar loop fuses fine).
     for (uint8_t o = 0; o < numOut; ++o) {
         const bool  oMuted = outputs_[o].muted.load(std::memory_order_relaxed);
         const float oVol   = outputs_[o].volume.load(std::memory_order_relaxed);
         float* dst = outBuses[o];
+
+        if (oMuted) {
+            std::memset(dst, 0, stereo * sizeof(float));
+        } else {
+#if CROSSPAD_MIXER_USE_ESP_DSP
+            dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
+#else
+            for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
+#endif
+        }
+
         float pL = 0.0f, pR = 0.0f;
         for (uint32_t i = 0; i < frames; ++i) {
-            float l = oMuted ? 0.0f : dst[i * 2 + 0] * oVol;
-            float r = oMuted ? 0.0f : dst[i * 2 + 1] * oVol;
+            float l = dst[i * 2 + 0];
+            float r = dst[i * 2 + 1];
             if (l >  1.0f) l =  1.0f;
             if (l < -1.0f) l = -1.0f;
             if (r >  1.0f) r =  1.0f;

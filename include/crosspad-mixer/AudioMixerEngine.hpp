@@ -230,6 +230,13 @@ private:
     mutable std::mutex registrationMutex_;
 
     std::vector<int16_t> tapBuf_;
+
+    // Per-render scratch used by the esp-dsp render path: holds (channel
+    // signal × gain) before being added into the output bus. Sized in
+    // setup() so the audio thread never allocates. On non-IDF builds
+    // (no esp-dsp) this buffer is unused but kept to keep the layout
+    // stable across platforms.
+    std::vector<float> mixScratch_;
 };
 
 /// Global mixer engine accessor (initialized by platform bootstrap).
