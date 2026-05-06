@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
@@ -118,6 +119,11 @@ private:
 
     std::atomic<crosspad::AudioRingBuffer<int16_t>*> tapBuffer_{nullptr};
     std::atomic<uint8_t> tapOutput_{0};  // MixerOutput::OUT1
+
+    // Serializes save/load against each other and against concurrent setters.
+    // Atomic per-route fields handle render-time access; this mutex only
+    // guards persistence flushes, so audio thread never waits.
+    mutable std::mutex stateMutex_;
 
     // Render-time scratch (sized lazily on first render call).
     std::vector<float>   inFloatBuf_[MIXER_NUM_INPUTS];   // interleaved stereo float

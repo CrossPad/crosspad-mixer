@@ -286,6 +286,8 @@ void AudioMixerEngine::setDefaults()
 
 void AudioMixerEngine::saveState(const std::string& path) const
 {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+
     JsonDocument doc;
 
     // Route matrix
@@ -317,17 +319,30 @@ void AudioMixerEngine::saveState(const std::string& path) const
         ob["muted"] = outputs_[o].muted.load(std::memory_order_relaxed);
     }
 
-    std::ofstream f(path);
-    if (!f.is_open()) {
-        printf("[Mixer] Failed to save state to %s\n", path.c_str());
+    // Atomic file write: serialize to a sibling .tmp file, fsync-equivalent
+    // (close), then rename over the target. Prevents partial reads if the
+    // process is killed mid-write.
+    const std::string tmpPath = path + ".tmp";
+    {
+        std::ofstream f(tmpPath);
+        if (!f.is_open()) {
+            printf("[Mixer] Failed to save state to %s\n", tmpPath.c_str());
+            return;
+        }
+        serializeJsonPretty(doc, f);
+    }
+    if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        printf("[Mixer] Failed to commit %s → %s\n", tmpPath.c_str(), path.c_str());
+        std::remove(tmpPath.c_str());
         return;
     }
-    serializeJsonPretty(doc, f);
     printf("[Mixer] State saved to %s\n", path.c_str());
 }
 
 void AudioMixerEngine::loadState(const std::string& path)
 {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+
     std::ifstream f(path);
     if (!f.is_open()) {
         printf("[Mixer] No saved state at %s, using defaults\n", path.c_str());
