@@ -3,8 +3,8 @@
  * @brief Pad handler for mixer mute/solo/route toggles.
  */
 
-#include "MixerPadLogic.hpp"
-#include "AudioMixerEngine.hpp"
+#include "crosspad-mixer/MixerPadLogic.hpp"
+#include "crosspad-mixer/AudioMixerEngine.hpp"
 
 #include <crosspad/pad/PadManager.hpp>
 #include <cstdio>

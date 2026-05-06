@@ -1,17 +1,18 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.1.0",
-  "description": "Audio mixer/router with VU meters, routing matrix, channel strips",
+  "version": "0.2.0",
+  "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
   "component_path": "components/crosspad-mixer",
-  "platforms": ["pc"],
+  "platforms": ["pc", "esp-idf"],
   "requires": {
     "crosspad-core": ">=0.3.0",
     "crosspad-gui": ">=0.2.0"
   },
   "changelog": [
+    "0.2.0: Dynamic IAudioNode-based channels (up to 16 × 8 outputs); ESP-IDF build target",
     "0.1.0: Initial release — VU meters, 3x2 routing matrix, volume + mute/solo"
   ]
 }
