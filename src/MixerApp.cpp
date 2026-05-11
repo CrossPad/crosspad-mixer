@@ -33,6 +33,8 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
+#include "crosspad/pad/PadManager.hpp"
+#include <memory>
 #include <crosspad/app/AppRegistry.hpp>
 #include <crosspad/pad/PadManager.hpp>
 #include <crosspad/platform/PlatformServices.hpp>
@@ -335,6 +337,14 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* a) {
     s_thisApp = a;
     auto& engine = getMixerEngine();
 
+    // Register MixerPadLogic with PadManager so setActivePadLogic("Mixer")
+    // resolves to an actual handler. Constructed once on first open; reused
+    // on subsequent opens. Empty deleter — lifetime owned by the static.
+    static MixerPadLogic s_mixerPadLogic(engine);
+    static auto s_mixerPadLogicPtr =
+        std::shared_ptr<MixerPadLogic>(&s_mixerPadLogic, [](MixerPadLogic*){});
+    crosspad::getPadManager().registerPadLogic("Mixer", s_mixerPadLogicPtr);
+
 #ifdef MIXER_USE_ENCODER
     if (indev_encoderTop) {
         s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
@@ -569,6 +579,8 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* a) {
 }
 
 void Mixer_destroy(lv_obj_t* app_obj) {
+    crosspad::getPadManager().setActivePadLogic("");
+    crosspad::getPadManager().unregisterPadLogic("Mixer");
     if (s_vuTimer) {
         lv_timer_delete(s_vuTimer);
         s_vuTimer = nullptr;
