@@ -1,10 +1,19 @@
 {
     "name": "crosspad-mixer",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "CrossPad audio mixer/router with VU meters, routing matrix, channel strips",
-    "keywords": ["crosspad", "mixer", "audio", "lvgl"],
-    "frameworks": ["arduino"],
-    "platforms": ["espressif32"],
+    "keywords": [
+        "crosspad",
+        "mixer",
+        "audio",
+        "lvgl"
+    ],
+    "frameworks": [
+        "arduino"
+    ],
+    "platforms": [
+        "espressif32"
+    ],
     "dependencies": {
         "crosspad-core": "*",
         "crosspad-gui": "*"
