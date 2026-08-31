@@ -337,9 +337,10 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* a) {
     s_thisApp = a;
     auto& engine = getMixerEngine();
 
-    // Register MixerPadLogic with PadManager so setActivePadLogic("Mixer")
-    // resolves to an actual handler. Constructed once on first open; reused
-    // on subsequent opens. Empty deleter — lifetime owned by the static.
+    // Register MixerPadLogic with PadManager so pushPadLogic("Mixer") (framework-
+    // owned, see REGISTER_APP_PL below) resolves to an actual handler.
+    // Constructed once on first open; reused on subsequent opens. Empty
+    // deleter — lifetime owned by the static.
     static MixerPadLogic s_mixerPadLogic(engine);
     static auto s_mixerPadLogicPtr =
         std::shared_ptr<MixerPadLogic>(&s_mixerPadLogic, [](MixerPadLogic*){});
@@ -554,17 +555,15 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* a) {
         lv_obj_set_pos(s_outMuteButtons[out], xBase + 128, 2);
     }
 
-    /* Lifecycle: route pad input through the global MixerPadLogic if it has
-     * been registered by the platform bootstrap. */
+    /* Lifecycle: pad logic activation/restore is framework-owned (see
+     * REGISTER_APP_PL below) — these callbacks only manage encoder focus. */
     if (a) {
         a->setOnShow([](lv_obj_t*) {
-            crosspad::getPadManager().setActivePadLogic("Mixer");
 #ifdef MIXER_USE_ENCODER
             if (s_encGroup && indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_encGroup);
 #endif
         });
         a->setOnHide([](lv_obj_t*) {
-            crosspad::getPadManager().setActivePadLogic("");
 #ifdef MIXER_USE_ENCODER
             if (indev_encoderTop && s_prevEncGroup) {
                 lv_indev_set_group(indev_encoderTop, s_prevEncGroup);
@@ -579,7 +578,6 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* a) {
 }
 
 void Mixer_destroy(lv_obj_t* app_obj) {
-    crosspad::getPadManager().setActivePadLogic("");
     crosspad::getPadManager().unregisterPadLogic("Mixer");
     if (s_vuTimer) {
         lv_timer_delete(s_vuTimer);
@@ -609,6 +607,6 @@ void Mixer_destroy(lv_obj_t* app_obj) {
     lv_obj_delete_async(app_obj);
 }
 
-REGISTER_APP(Mixer, nullptr, "mixer.png",
-             Mixer_create, Mixer_destroy,
-             nullptr, nullptr, nullptr, 0)
+REGISTER_APP_PL(Mixer, nullptr, "mixer.png",
+                Mixer_create, Mixer_destroy,
+                nullptr, nullptr, nullptr, 0, "Mixer")
