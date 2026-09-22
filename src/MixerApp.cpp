@@ -609,4 +609,4 @@ void Mixer_destroy(lv_obj_t* app_obj) {
 
 REGISTER_APP_PL(Mixer, nullptr, "mixer.png",
                 Mixer_create, Mixer_destroy,
-                nullptr, nullptr, nullptr, 0, "Mixer")
+                nullptr, nullptr, nullptr, 0, "Mixer", true)
