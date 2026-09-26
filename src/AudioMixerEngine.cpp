@@ -21,6 +21,8 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <iterator>
+#include <string>
 
 AudioMixerEngine::AudioMixerEngine() {
     for (auto& slot : channels_) {
@@ -62,6 +64,7 @@ void AudioMixerEngine::resetChannelSlot(ChannelSlot& s) {
     s.volume.store(1.0f, std::memory_order_relaxed);
     s.muted .store(false, std::memory_order_relaxed);
     s.soloed.store(false, std::memory_order_relaxed);
+    s.pan   .store(0.0f, std::memory_order_relaxed);
     s.peakL .store(0.0f, std::memory_order_relaxed);
     s.peakR .store(0.0f, std::memory_order_relaxed);
 }
@@ -142,6 +145,27 @@ uint8_t AudioMixerEngine::numActiveChannels() const {
     for (const auto& slot : channels_)
         if (slot.active.load(std::memory_order_acquire)) ++n;
     return n;
+}
+
+void AudioMixerEngine::setOutputName(OutputId out, const char* name) {
+    if (out >= kMixerMaxOutputs) return;
+    std::strncpy(outputs_[out].name, name ? name : "", kMixerNameLen - 1);
+    outputs_[out].name[kMixerNameLen - 1] = 0;
+}
+
+const char* AudioMixerEngine::getOutputName(OutputId out) const {
+    return out < kMixerMaxOutputs ? outputs_[out].name : "";
+}
+
+void AudioMixerEngine::setChannelPan(ChannelId ch, float pan) {
+    if (ch >= kMixerMaxChannels) return;
+    if (pan < -1.0f) pan = -1.0f;
+    if (pan >  1.0f) pan =  1.0f;
+    channels_[ch].pan.store(pan, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getChannelPan(ChannelId ch) const {
+    return ch < kMixerMaxChannels ? channels_[ch].pan.load(std::memory_order_relaxed) : 0.0f;
 }
 
 const char* AudioMixerEngine::getChannelName(ChannelId ch) const {
@@ -330,6 +354,20 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         const bool soloed = slot.soloed.load(std::memory_order_relaxed);
         if (anySoloed && !soloed) continue;
 
+        /* Pan once, in the channel's own scratch, before it is sent anywhere:
+         * every send then carries the same placement, as on a desk. After the
+         * meter above, which stays pre-fader and pre-pan. */
+        const float pan = slot.pan.load(std::memory_order_relaxed);
+        if (pan != 0.0f) {
+            const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
+            const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
+            float* s = slot.scratch.data();
+            for (uint32_t i = 0; i < frames; ++i) {
+                s[i * 2 + 0] *= gl;
+                s[i * 2 + 1] *= gr;
+            }
+        }
+
         const float chVol = slot.volume.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
         for (uint8_t o = 0; o < numOut; ++o) {
@@ -415,11 +453,11 @@ void AudioMixerEngine::setTapOutput(OutputId out) {
 
 // ── State persistence (filesystem JSON; PC; gated to non-embedded) ────────
 
-void AudioMixerEngine::saveState(const std::string& path) const {
+std::string AudioMixerEngine::stateJson() const {
     std::lock_guard<std::mutex> lock(registrationMutex_);
 
     JsonDocument doc;
-    doc["version"] = 2;
+    doc["version"] = 3;
     doc["numOutputs"] = numOutputs_;
 
     JsonArray channelsArr = doc["channels"].to<JsonArray>();
@@ -432,6 +470,7 @@ void AudioMixerEngine::saveState(const std::string& path) const {
         c["volume"] = slot.volume.load(std::memory_order_relaxed);
         c["muted"]  = slot.muted .load(std::memory_order_relaxed);
         c["soloed"] = slot.soloed.load(std::memory_order_relaxed);
+        c["pan"]    = slot.pan   .load(std::memory_order_relaxed);
         JsonArray routes = c["routes"].to<JsonArray>();
         for (uint8_t o = 0; o < numOutputs_; ++o) {
             JsonObject r = routes.add<JsonObject>();
@@ -448,6 +487,53 @@ void AudioMixerEngine::saveState(const std::string& path) const {
         ob["muted"]  = outputs_[o].muted .load(std::memory_order_relaxed);
     }
 
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+}
+
+bool AudioMixerEngine::applyStateJson(const std::string& json) {
+    std::lock_guard<std::mutex> lock(registrationMutex_);
+
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+
+    JsonArray channelsArr = doc["channels"];
+    for (JsonObject c : channelsArr) {
+        int id = c["id"] | -1;
+        if (id < 0 || id >= kMixerMaxChannels) continue;
+        auto& slot = channels_[id];
+        /* By slot and by name: a build that registers its channels in another
+         * order must not hand one channel's settings to a different one. */
+        const char* name = c["name"] | "";
+        if (slot.name[0] && name[0] && std::strcmp(slot.name, name) != 0) continue;
+        slot.volume.store(c["volume"] | 1.0f, std::memory_order_relaxed);
+        slot.muted .store(c["muted"]  | false, std::memory_order_relaxed);
+        slot.soloed.store(c["soloed"] | false, std::memory_order_relaxed);
+        slot.pan   .store(c["pan"]    | 0.0f, std::memory_order_relaxed);
+        JsonArray routes = c["routes"];
+        for (JsonObject r : routes) {
+            int o = r["out"] | -1;
+            if (o < 0 || o >= kMixerMaxOutputs) continue;
+            slot.routeEnabled[o].store(r["enabled"] | false, std::memory_order_relaxed);
+            slot.routeVol[o]    .store(r["volume"]  | 1.0f,  std::memory_order_relaxed);
+        }
+    }
+
+    int idx = 0;
+    JsonArray outArr = doc["outputs"];
+    for (JsonObject ob : outArr) {
+        if (idx >= kMixerMaxOutputs) break;
+        outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
+        outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
+        ++idx;
+    }
+    return true;
+}
+
+void AudioMixerEngine::saveState(const std::string& path) const {
+    const std::string json = stateJson();
+
     // Atomic file write: tmp + rename, prevents partial reads on kill.
     const std::string tmpPath = path + ".tmp";
     {
@@ -456,8 +542,9 @@ void AudioMixerEngine::saveState(const std::string& path) const {
             printf("[Mixer] Failed to save state to %s\n", tmpPath.c_str());
             return;
         }
-        serializeJsonPretty(doc, f);
+        f << json;
     }
+    std::remove(path.c_str());   // rename() will not replace on FatFs
     if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
         printf("[Mixer] Failed to commit %s → %s\n", tmpPath.c_str(), path.c_str());
         std::remove(tmpPath.c_str());
@@ -467,52 +554,15 @@ void AudioMixerEngine::saveState(const std::string& path) const {
 }
 
 void AudioMixerEngine::loadState(const std::string& path) {
-    std::lock_guard<std::mutex> lock(registrationMutex_);
-
     std::ifstream f(path);
     if (!f.is_open()) {
         printf("[Mixer] No saved state at %s, leaving defaults\n", path.c_str());
         return;
     }
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, f);
-    if (err) {
-        printf("[Mixer] State parse error: %s, leaving defaults\n", err.c_str());
+    const std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!applyStateJson(json)) {
+        printf("[Mixer] State parse error in %s, leaving defaults\n", path.c_str());
         return;
     }
-
-    JsonArray channelsArr = doc["channels"];
-    if (channelsArr) {
-        for (JsonObject c : channelsArr) {
-            int id = c["id"] | -1;
-            if (id < 0 || id >= kMixerMaxChannels) continue;
-            auto& slot = channels_[id];
-            slot.volume.store(c["volume"] | 1.0f, std::memory_order_relaxed);
-            slot.muted .store(c["muted"]  | false, std::memory_order_relaxed);
-            slot.soloed.store(c["soloed"] | false, std::memory_order_relaxed);
-            JsonArray routes = c["routes"];
-            if (routes) {
-                for (JsonObject r : routes) {
-                    int o = r["out"] | -1;
-                    if (o < 0 || o >= kMixerMaxOutputs) continue;
-                    slot.routeEnabled[o].store(r["enabled"] | false, std::memory_order_relaxed);
-                    slot.routeVol[o]    .store(r["volume"]  | 1.0f,  std::memory_order_relaxed);
-                }
-            }
-        }
-    }
-
-    JsonArray outArr = doc["outputs"];
-    if (outArr) {
-        int idx = 0;
-        for (JsonObject ob : outArr) {
-            if (idx >= kMixerMaxOutputs) break;
-            outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
-            outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
-            ++idx;
-        }
-    }
-
     printf("[Mixer] State loaded from %s\n", path.c_str());
 }
