@@ -2,10 +2,8 @@
 
 /**
  * @file MixerApp.hpp
- * @brief Audio Mixer/Router app for CrossPad PC.
- *
- * Full routing matrix (3 inputs x 2 outputs) with per-channel volume,
- * mute/solo, VU meters, and 4x4 pad control.
+ * @brief Mixer and signal router: a channel strip per source, a master per
+ * output, and a send matrix between them.
  */
 
 class App;
