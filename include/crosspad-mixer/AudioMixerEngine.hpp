@@ -94,6 +94,12 @@ public:
     uint8_t numOutputs() const { return numOutputs_; }
     uint8_t maxOutputs() const { return kMixerMaxOutputs; }
 
+    /// What an output is called on screen ("Speakers", "USB rec"). Set by the
+    /// platform, which is the only one that knows where each bus goes; ""
+    /// until it does.
+    void        setOutputName(OutputId out, const char* name);
+    const char* getOutputName(OutputId out) const;
+
     // ── Routing matrix ─────────────────────────────────────────────────────
 
     void  setRouteEnabled(ChannelId ch, OutputId out, bool enabled);
@@ -109,6 +115,11 @@ public:
     bool  isChannelMuted  (ChannelId ch) const;
     void  setChannelSolo  (ChannelId ch, bool soloed);
     bool  isChannelSoloed (ChannelId ch) const;
+    /// Balance, -1 (left) .. 0 (centre) .. +1 (right). Unity at the centre:
+    /// turning it only ever takes level away from the other side, so a
+    /// centred channel sounds exactly as it did before pan existed.
+    void  setChannelPan   (ChannelId ch, float pan);
+    float getChannelPan   (ChannelId ch) const;
     bool  isAnySoloed     () const;
 
     // ── Output bus control ─────────────────────────────────────────────────
@@ -143,6 +154,13 @@ public:
 
     void saveState(const std::string& path) const;
     void loadState(const std::string& path);
+
+    /// The same state as a JSON string, for a platform that keeps it
+    /// somewhere other than a file (NVS on the board).
+    std::string stateJson() const;
+    /// Apply a string from stateJson(). False when it does not parse, in
+    /// which case nothing is changed.
+    bool applyStateJson(const std::string& json);
 
     /// Called from non-render threads after the GUI mutates routing/volumes.
     /// Use it to flush state to disk / NVS without putting platform-specific
@@ -195,6 +213,7 @@ private:
         std::atomic<float> volume{1.0f};
         std::atomic<bool>  muted{false};
         std::atomic<bool>  soloed{false};
+        std::atomic<float> pan{0.0f};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
 
@@ -205,6 +224,7 @@ private:
     };
 
     struct OutputSlot {
+        char name[kMixerNameLen] = {0};
         std::atomic<float> volume{1.0f};
         std::atomic<bool>  muted{false};
         std::atomic<float> peakL{0.0f};
