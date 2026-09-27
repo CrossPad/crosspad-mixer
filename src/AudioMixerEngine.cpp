@@ -157,6 +157,14 @@ const char* AudioMixerEngine::getOutputName(OutputId out) const {
     return out < kMixerMaxOutputs ? outputs_[out].name : "";
 }
 
+void AudioMixerEngine::setOutputHeard(OutputId out, bool heard) {
+    if (out < kMixerMaxOutputs) outputs_[out].heard.store(heard, std::memory_order_relaxed);
+}
+
+bool AudioMixerEngine::isOutputHeard(OutputId out) const {
+    return out < kMixerMaxOutputs && outputs_[out].heard.load(std::memory_order_relaxed);
+}
+
 void AudioMixerEngine::setChannelPan(ChannelId ch, float pan) {
     if (ch >= kMixerMaxChannels) return;
     if (pan < -1.0f) pan = -1.0f;

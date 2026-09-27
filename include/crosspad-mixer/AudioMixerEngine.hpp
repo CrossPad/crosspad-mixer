@@ -99,6 +99,11 @@ public:
     /// until it does.
     void        setOutputName(OutputId out, const char* name);
     const char* getOutputName(OutputId out) const;
+    /// Whether an output is heard -- a speaker, a jack -- or only records (a
+    /// USB recording bus): what an input's MONITOR switches between. True
+    /// until the platform says otherwise.
+    void setOutputHeard(OutputId out, bool heard);
+    bool isOutputHeard(OutputId out) const;
 
     // ── Routing matrix ─────────────────────────────────────────────────────
 
@@ -227,6 +232,7 @@ private:
         char name[kMixerNameLen] = {0};
         std::atomic<float> volume{1.0f};
         std::atomic<bool>  muted{false};
+        std::atomic<bool>  heard{true};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
     };

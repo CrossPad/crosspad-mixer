@@ -5,15 +5,19 @@
  * The categories are tabs along the bottom, one page each:
  *
  *   IN       what comes into the board: the mics, the line-in jack, USB audio
- *            from the host. The mics and the jack carry their input GAIN.
+ *            from the host. The mics and the jack carry their input GAIN, and
+ *            each input its MONITOR: which of the outputs you hear -- 1/2,
+ *            3/4, both or neither (the outputs the engine marks heard; a
+ *            recording bus keeps its own send).
  *   SOURCES  what the board plays: the sampler, the pitched instrument, the
  *            click, the song, the recorder's and slicer's preview.
  *   OUT      the masters: speakers, phones, the USB recording bus.
  *   ROUTE    the send matrix: which source goes to which output, how loud.
  *
  * A channel is one row: its name, a long fader in dB with a post-fader meter
- * under it, the dB, mute and solo. Tap the name for the rest of the channel:
- * input gain, pan, and its sends.
+ * under it, the dB, mute and solo -- an input has MON where the others have
+ * solo. Tap the name for the rest of the channel: input gain, monitor, pan,
+ * and its sends.
  *
  * The engine is the only state: widgets are written from it every tick
  * unless a finger or the encoder has hold of them, so anything else that
@@ -99,6 +103,17 @@ const Look* look_for(const char* name)
     return nullptr;
 }
 
+/// What an output is, under its name, for the outputs a board names as pairs.
+const char* output_role(const char* name)
+{
+    static const struct { const char* name; const char* role; } kRoles[] = {
+        {"Out 1/2", "speakers"},
+        {"Out 3/4", "phones"},
+    };
+    for (const auto& r : kRoles) if (std::strcmp(r.name, name) == 0) return r.role;
+    return "master";
+}
+
 struct Row {
     bool      output = false;
     uint8_t   id = 0;            // channel id, or output id
@@ -111,6 +126,7 @@ struct Row {
     lv_obj_t* db = nullptr;
     lv_obj_t* mute = nullptr;
     lv_obj_t* solo = nullptr;
+    lv_obj_t* mon = nullptr;     // inputs: which heard outputs get it
     float     shown = 0.0f;      // meter, decaying
 };
 
@@ -137,6 +153,9 @@ lv_obj_t* s_dPan = nullptr;
 lv_obj_t* s_dPanLabel = nullptr;
 lv_obj_t* s_dSends[kMixerMaxOutputs] = {};
 lv_obj_t* s_dSendLabels[kMixerMaxOutputs] = {};
+constexpr int kMaxMonChoices = kMixerMaxOutputs + 2;   // off, each heard output, all
+lv_obj_t* s_dMon[kMaxMonChoices] = {};
+uint32_t  s_dMonMask[kMaxMonChoices] = {};
 int       s_gainInput = -1;          // IInputGain index of the channel in the window
 
 #ifdef MIXER_USE_ENCODER
@@ -155,6 +174,65 @@ int gain_input_of(uint8_t ch)
     const char* name = getMixerEngine().getChannelName(ch);
     for (int i = 0; i < g->inputs(); ++i) if (std::strcmp(g->channelName(i), name) == 0) return i;
     return -1;
+}
+
+// ── monitor: an input's sends to the outputs you hear ─────────────────────
+
+/// The heard outputs, in order; @return how many.
+int heard_outputs(uint8_t* out)
+{
+    auto& m = getMixerEngine();
+    int n = 0;
+    for (uint8_t o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
+        if (m.isOutputHeard(o)) out[n++] = o;
+    }
+    return n;
+}
+
+/// Which heard outputs @p ch is sent to, bit i = the i-th heard output.
+uint32_t monitor_mask(uint8_t ch)
+{
+    uint8_t heard[kMixerMaxOutputs];
+    const int n = heard_outputs(heard);
+    uint32_t mask = 0;
+    for (int i = 0; i < n; ++i) if (getMixerEngine().isRouteEnabled(ch, heard[i])) mask |= 1u << i;
+    return mask;
+}
+
+/// Send @p ch to exactly the heard outputs in @p mask; a send switched on
+/// that was dragged to nothing comes back at unity.
+void set_monitor(uint8_t ch, uint32_t mask)
+{
+    auto& m = getMixerEngine();
+    uint8_t heard[kMixerMaxOutputs];
+    const int n = heard_outputs(heard);
+    for (int i = 0; i < n; ++i) {
+        const bool on = mask & (1u << i);
+        if (on && m.getRouteVolume(ch, heard[i]) <= 0.0f) m.setRouteVolume(ch, heard[i], 1.0f);
+        m.setRouteEnabled(ch, heard[i], on);
+    }
+}
+
+/// An output as MONITOR names it: the last word of its name ("Out 1/2" is
+/// "1/2"), short enough for the button.
+void short_output_name(char* buf, size_t n, uint8_t o)
+{
+    const char* name = getMixerEngine().getOutputName(o);
+    const char* sp = std::strrchr(name, ' ');
+    std::snprintf(buf, n, "%.5s", sp ? sp + 1 : name);
+}
+
+/// What the MON button says for @p mask.
+void monitor_text(char* buf, size_t n, uint32_t mask)
+{
+    uint8_t heard[kMixerMaxOutputs];
+    const int count = heard_outputs(heard);
+    if (!mask) { std::snprintf(buf, n, "off"); return; }
+    if (count > 1 && mask == (1u << count) - 1) { std::snprintf(buf, n, count == 2 ? "both" : "all"); return; }
+    for (int i = 0; i < count; ++i) {
+        if (mask == (1u << i)) { short_output_name(buf, n, heard[i]); return; }
+    }
+    std::snprintf(buf, n, "some");
 }
 
 // ── scales and text ────────────────────────────────────────────────────────
@@ -301,6 +379,16 @@ void solo_cb(lv_event_t* e)
     m.setChannelSolo(r.id, !m.isChannelSoloed(r.id));
 }
 
+/// A tap moves MONITOR on: off, each heard output alone, then all of them.
+void mon_cb(lv_event_t* e)
+{
+    Row& r = row_of(e);
+    uint8_t heard[kMixerMaxOutputs];
+    const int n = heard_outputs(heard);
+    if (!n) return;
+    set_monitor(r.id, (monitor_mask(r.id) + 1) & ((1u << n) - 1));
+}
+
 // ── the channel window: gain, pan, sends ───────────────────────────────────
 
 void rebuild_group();
@@ -321,6 +409,8 @@ void detail_labels()
         buf[0] = 'P';
         set_text(s_dPanLabel, buf);
     }
+    const uint32_t mon = monitor_mask(r.id);
+    for (int i = 0; i < kMaxMonChoices; ++i) paint(s_dMon[i], s_dMon[i] && s_dMonMask[i] == mon, kAccent);
     for (int o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
         if (!s_dSendLabels[o]) continue;
         if (!m.isRouteEnabled(r.id, o)) std::snprintf(buf, sizeof(buf), "%s  off", m.getOutputName(o));
@@ -372,6 +462,7 @@ void close_detail()
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
+    for (auto& s : s_dMon) s = nullptr;
     s_detailRow = -1;
     s_gainInput = -1;
 }
@@ -434,6 +525,38 @@ void open_detail(int idx)
         const int32_t steps = (int32_t)lroundf(g->maxDb() / g->stepDb());
         s_dGain = detail_slider(0, steps, (int32_t)lroundf(g->gainDb(s_gainInput) / g->stepDb()), color, gain_cb, nullptr);
     }
+    if (look && look->page == kIn) {
+        /* Where it is heard, chosen outright: off, each output, all of them. */
+        uint8_t heard[kMixerMaxOutputs];
+        const int n = heard_outputs(heard);
+        detail_line("Monitor", nullptr);
+        lv_obj_t* seg = make_box(s_detail);
+        lv_obj_set_size(seg, LV_PCT(94), 28);
+        lv_obj_set_flex_flow(seg, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(seg, 4, 0);
+        int k = 0;
+        auto choice = [&](const char* text, uint32_t mask) {
+            lv_obj_t* b = make_button(seg, 10, 28, text, [](lv_event_t* e) {
+                const int i = (int)(intptr_t)lv_event_get_user_data(e);
+                if (s_detailRow < 0) return;
+                set_monitor(s_rows[s_detailRow].id, s_dMonMask[i]);
+                detail_labels();
+            }, (void*)(intptr_t)k);
+            lv_obj_set_flex_grow(b, 1);
+#ifdef MIXER_USE_ENCODER
+            if (s_detailGroup) lv_group_add_obj(s_detailGroup, b);
+#endif
+            s_dMon[k] = b;
+            s_dMonMask[k++] = mask;
+        };
+        choice("off", 0);
+        for (int i = 0; i < n && k < kMaxMonChoices - 1; ++i) {
+            char name[8];
+            short_output_name(name, sizeof(name), heard[i]);
+            choice(name, 1u << i);
+        }
+        if (n > 1) choice(n == 2 ? "both" : "all", (1u << n) - 1);
+    }
     detail_line("", &s_dPanLabel);
     s_dPan = detail_slider(-50, 50, (int32_t)lroundf(m.getChannelPan(r.id) * 50.0f), color, dpan_cb, nullptr);
     lv_slider_set_mode(s_dPan, LV_SLIDER_MODE_SYMMETRICAL);
@@ -485,6 +608,7 @@ void rebuild_group()
             if (!lv_obj_has_state(r.fader, LV_STATE_DISABLED)) add_to_group(r.fader);
             add_to_group(r.mute);
             add_to_group(r.solo);
+            add_to_group(r.mon);
         }
     }
     add_to_group(s_back);
@@ -544,6 +668,19 @@ void tick_row(Row& r, bool anySolo)
         l *= scale;
         rr *= scale;
         paint(r.solo, soloed, kSolo);
+        if (r.mon) {
+            /* Lit while the input is heard anywhere; the caption dim when not. */
+            const uint32_t mask = monitor_mask(r.id);
+            monitor_text(buf, sizeof(buf), mask);
+            lv_obj_t* cap = lv_obj_get_child(r.mon, 0);
+            lv_obj_t* val = lv_obj_get_child(r.mon, 1);
+            set_text(val, buf);
+            const lv_color_t bg = mask ? kAccent : kTrack;
+            const lv_color_t capInk = mask ? kInk : kDim, valInk = mask ? kInk : kText;
+            if (!lv_color_eq(lv_obj_get_style_bg_color(r.mon, 0), bg)) lv_obj_set_style_bg_color(r.mon, bg, 0);
+            if (!lv_color_eq(lv_obj_get_style_text_color(cap, 0), capInk)) lv_obj_set_style_text_color(cap, capInk, 0);
+            if (!lv_color_eq(lv_obj_get_style_text_color(val, 0), valInk)) lv_obj_set_style_text_color(val, valInk, 0);
+        }
         const int gi = gain_input_of(r.id);
         if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
         else         pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
@@ -648,7 +785,7 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     r.sub = lv_label_create(r.name);
     lv_obj_set_style_text_font(r.sub, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(r.sub, kDim, 0);
-    lv_label_set_text(r.sub, output ? "master" : "");
+    lv_label_set_text(r.sub, output ? output_role(m.getOutputName(id)) : "");
 
     /* The fader, long, with the post-fader meter under it. */
     lv_obj_t* lane = make_box(r.box);
@@ -678,7 +815,17 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     lv_label_set_text(r.db, "");
 
     r.mute = make_button(r.box, 26, 24, "M", mute_cb, (void*)(intptr_t)idx);
-    if (!output) {
+    if (!output && where == kIn) {
+        /* MON: a caption and where the input is heard, one under the other. */
+        r.mon = make_button(r.box, 44, 24, "MON", mon_cb, (void*)(intptr_t)idx, &lv_font_montserrat_10);
+        lv_obj_t* cap = lv_obj_get_child(r.mon, 0);
+        lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_t* val = lv_label_create(r.mon);
+        lv_obj_set_style_text_font(val, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(val, kText, 0);
+        lv_label_set_text(val, "");
+        lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, 0);
+    } else if (!output) {
         r.solo = make_button(r.box, 26, 24, "S", solo_cb, (void*)(intptr_t)idx);
     } else {
         lv_obj_t* gap = make_box(r.box);
@@ -884,6 +1031,7 @@ void Mixer_destroy(lv_obj_t* app_obj)
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
+    for (auto& s : s_dMon) s = nullptr;
     s_detailRow = s_gainInput = -1;
     for (auto& r : s_rows) r = Row{};
     for (auto& row : s_sends) for (auto& c : row) c = nullptr;
