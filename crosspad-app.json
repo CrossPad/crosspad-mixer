@@ -15,7 +15,7 @@
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
-    "0.5.0: MONITOR on every input (MON on its row, a Monitor row in its window): off, 1/2, 3/4 or both -- the outputs the engine marks heard; outputs named 1/2 (speakers) and 3/4 (phones); AudioMixerEngine::setOutputHeard/isOutputHeard",
+    "0.5.0 (0.4.1 merged in: builds on the PC against LVGL 9.4): MONITOR on every input (MON on its row, a Monitor row in its window): off, 1/2, 3/4 or both -- the outputs the engine marks heard; outputs named 1/2 (speakers) and 3/4 (phones); AudioMixerEngine::setOutputHeard/isOutputHeard",
     "0.4.0: IN / SOURCES / OUT / ROUTE tabs along the bottom, a row per channel with a long fader, the channel window (input gain, pan, sends); requires core 1.25 (IInputGain) and gui 1.14",
     "0.2.1: Merge lvgl.h include fix + PlatformIO library.json with MixerPadLogic registration",
     "0.2.0: Dynamic IAudioNode-based channels (up to 16 × 8 outputs); ESP-IDF build target",
