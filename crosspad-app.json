@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.6.0: PRESETS (the list tab) -- the whole desk (levels, mutes, pan, sends, outputs, input gain) saved under a name on the card, loaded back, UNDO for the last load; STREAM, BEATS and SAMPLING start as a starting point for their name; MixerPresets, the platform names the folder",
     "0.5.0 (0.4.1 merged in: builds on the PC against LVGL 9.4): MONITOR on every input (MON on its row, a Monitor row in its window): off, 1/2, 3/4 or both -- the outputs the engine marks heard; outputs named 1/2 (speakers) and 3/4 (phones); AudioMixerEngine::setOutputHeard/isOutputHeard",
     "0.4.0: IN / SOURCES / OUT / ROUTE tabs along the bottom, a row per channel with a long fader, the channel window (input gain, pan, sends); requires core 1.25 (IInputGain) and gui 1.14",
     "0.2.1: Merge lvgl.h include fix + PlatformIO library.json with MixerPadLogic registration",

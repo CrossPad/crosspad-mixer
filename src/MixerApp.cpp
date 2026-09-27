@@ -13,6 +13,9 @@
  *            click, the song, the recorder's and slicer's preview.
  *   OUT      the masters: speakers, phones, the USB recording bus.
  *   ROUTE    the send matrix: which source goes to which output, how loud.
+ *   PRESETS  (the list icon) the whole desk saved under a name, loaded back:
+ *            STREAM, BEATS, SAMPLING start as a starting point for their
+ *            name until saved over; UNDO puts back what a load replaced.
  *
  * A channel is one row: its name, a long fader in dB with a post-fader meter
  * under it, the dB, mute and solo -- an input has MON where the others have
@@ -27,6 +30,7 @@
 
 #include "crosspad-mixer/MixerApp.hpp"
 #include "crosspad-mixer/AudioMixerEngine.hpp"
+#include "crosspad-mixer/MixerPresets.hpp"
 
 #if __has_include("pc_stubs/PcApp.hpp")
   #include "pc_stubs/PcApp.hpp"
@@ -81,8 +85,8 @@ const lv_color_t kMeterOk = lv_color_hex(0x4FE0B0);
 const lv_color_t kMeterHi = lv_color_hex(0xFFC857);
 const lv_color_t kMeterClip = lv_color_hex(0xFF5C5C);
 
-enum Page : uint8_t { kIn, kSources, kOut, kRoute, kPages };
-const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE"};
+enum Page : uint8_t { kIn, kSources, kOut, kRoute, kPresets, kPages };
+const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", LV_SYMBOL_LIST};
 
 /// How a channel is named, coloured and filed, by the name it registers under.
 struct Look { const char* name; const char* label; uint32_t color; Page page; };
@@ -392,6 +396,8 @@ void mon_cb(lv_event_t* e)
 // ── the channel window: gain, pan, sends ───────────────────────────────────
 
 void rebuild_group();
+void add_presets_to_group();
+void refresh_presets();
 
 void detail_labels()
 {
@@ -600,6 +606,8 @@ void rebuild_group()
     if (s_page == kRoute) {
         for (int row = 0; row < s_sourceCount; ++row)
             for (int o = 0; o < kMixerMaxOutputs; ++o) add_to_group(s_sends[row][o]);
+    } else if (s_page == kPresets) {
+        add_presets_to_group();
     } else {
         for (int i = 0; i < s_rowCount; ++i) {
             const Row& r = s_rows[i];
@@ -630,6 +638,7 @@ void show_page(Page p)
         else        lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         paint(s_tabs[i], i == p, kAccent);
     }
+    if (p == kPresets) refresh_presets();     // the card is read when the list is shown
     rebuild_group();
 }
 
@@ -641,8 +650,190 @@ void back_cb(lv_event_t* e)
     if (app) app->destroyAppAsync();
 }
 
+// ── presets ────────────────────────────────────────────────────────────────
+
+struct PresetRow {
+    lv_obj_t* name = nullptr;
+    lv_obj_t* sub = nullptr;
+    lv_obj_t* load = nullptr;
+    lv_obj_t* save = nullptr;
+};
+PresetRow s_pre[crosspad::MixerPresets::kSlots];
+lv_obj_t* s_preStatus = nullptr;
+lv_obj_t* s_preUndo = nullptr;
+lv_obj_t* s_nameOv = nullptr;          // the name window a SAVE opens
+lv_obj_t* s_nameText = nullptr;
+int       s_nameSlot = -1;
+#ifdef MIXER_USE_ENCODER
+lv_group_t* s_nameGroup = nullptr;
+#endif
+
+void add_presets_to_group()
+{
+    if (s_preUndo && !lv_obj_has_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN)) add_to_group(s_preUndo);
+    for (auto& r : s_pre) {
+        add_to_group(r.load);
+        add_to_group(r.save);
+    }
+}
+
+void refresh_presets()
+{
+    auto& pr = crosspad::getMixerPresets();
+    pr.refresh();
+    for (int s = 0; s < crosspad::MixerPresets::kSlots; ++s) {
+        const auto& i = pr.info(s);
+        set_text(s_pre[s].name, i.name.c_str());
+        set_text(s_pre[s].sub, i.kind == crosspad::MixerPresets::Kind::Saved   ? "saved"
+                             : i.kind == crosspad::MixerPresets::Kind::Factory ? "starting point"
+                                                                                : "empty -- SAVE the desk here");
+        if (i.kind == crosspad::MixerPresets::Kind::Empty) lv_obj_add_state(s_pre[s].load, LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_pre[s].load, LV_STATE_DISABLED);
+    }
+    if (!pr.available()) set_text(s_preStatus, "Presets need the card.");
+    if (pr.canUndo()) lv_obj_remove_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
+    else              lv_obj_add_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
+}
+
+void preset_status(const char* fmt, const std::string& name)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), fmt, name.c_str());
+    set_text(s_preStatus, buf);
+}
+
+void load_cb(lv_event_t* e)
+{
+    const int s = (int)(intptr_t)lv_event_get_user_data(e);
+    auto& pr = crosspad::getMixerPresets();
+    const std::string name = pr.info(s).name;
+    if (pr.load(s)) preset_status("%s loaded -- UNDO puts the desk back.", name);
+    else            preset_status("%s could not be read.", name);
+    refresh_presets();
+    rebuild_group();
+}
+
+void undo_cb(lv_event_t*)
+{
+    if (crosspad::getMixerPresets().undo()) set_text(s_preStatus, "The desk is back as it was.");
+    refresh_presets();
+    rebuild_group();
+}
+
+void close_name()
+{
+    if (!s_nameOv) return;
+#ifdef MIXER_USE_ENCODER
+    if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
+    lv_group_delete_deferred(s_nameGroup);       // the keyboard's key is still being read
+    s_nameGroup = nullptr;
+#endif
+    lv_obj_delete_async(s_nameOv);
+    s_nameOv = s_nameText = nullptr;
+    s_nameSlot = -1;
+}
+
+void name_done_cb(lv_event_t* e)
+{
+    const bool ok = lv_event_get_code(e) == LV_EVENT_READY;
+    const std::string name = s_nameText ? lv_textarea_get_text(s_nameText) : "";
+    const int s = s_nameSlot;
+    close_name();
+    if (!ok || s < 0) return;
+    if (name.empty()) { set_text(s_preStatus, "A preset needs a name."); return; }
+    if (crosspad::getMixerPresets().save(s, name)) preset_status("The desk is saved as %s.", name);
+    else                                           preset_status("%s not saved: is the card in?", name);
+    refresh_presets();
+}
+
+/// SAVE asks for the name, the slot's own filled in: OK saves, the name
+/// window is the "are you sure" too.
+void save_cb(lv_event_t* e)
+{
+    if (s_nameOv) return;
+    s_nameSlot = (int)(intptr_t)lv_event_get_user_data(e);
+    s_nameOv = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_nameOv);
+    lv_obj_set_size(s_nameOv, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(s_nameOv, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_nameOv, kBg, 0);
+    lv_obj_set_style_bg_opa(s_nameOv, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_nameOv, 4, 0);
+    lv_obj_set_style_pad_row(s_nameOv, 4, 0);
+    lv_obj_set_flex_flow(s_nameOv, LV_FLEX_FLOW_COLUMN);
+    lv_obj_t* t = lv_label_create(s_nameOv);
+    lv_obj_set_style_text_color(t, kText, 0);
+    lv_label_set_text(t, "Save the desk as");
+    s_nameText = lv_textarea_create(s_nameOv);
+    lv_textarea_set_one_line(s_nameText, true);
+    lv_textarea_set_max_length(s_nameText, crosspad::MixerPresets::kMaxName);
+    lv_textarea_set_text(s_nameText, crosspad::getMixerPresets().info(s_nameSlot).name.c_str());
+    lv_obj_set_width(s_nameText, LV_PCT(100));
+    lv_obj_t* kb = lv_keyboard_create(s_nameOv);
+    lv_obj_set_width(kb, LV_PCT(100));
+    lv_obj_set_flex_grow(kb, 1);
+    lv_keyboard_set_textarea(kb, s_nameText);
+    lv_obj_add_event_cb(kb, name_done_cb, LV_EVENT_READY, nullptr);
+    lv_obj_add_event_cb(kb, name_done_cb, LV_EVENT_CANCEL, nullptr);
+#ifdef MIXER_USE_ENCODER
+    s_nameGroup = lv_group_create();
+    lv_group_add_obj(s_nameGroup, kb);
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_nameGroup);
+    lv_group_focus_obj(kb);
+    lv_group_set_editing(s_nameGroup, true);
+#endif
+}
+
+void build_presets(lv_obj_t* page)
+{
+    lv_obj_t* top = make_box(page);
+    lv_obj_set_size(top, LV_PCT(100), 26);
+    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(top, 4, 0);
+    s_preStatus = lv_label_create(top);
+    lv_obj_set_flex_grow(s_preStatus, 1);
+    lv_obj_set_style_text_font(s_preStatus, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_preStatus, kDim, 0);
+    lv_label_set_long_mode(s_preStatus, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_preStatus, "Levels, mutes, pan, sends, outputs, input gain.");
+    s_preUndo = make_button(top, 64, 24, LV_SYMBOL_REFRESH " UNDO", undo_cb, nullptr, &lv_font_montserrat_10);
+    lv_obj_add_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
+
+    for (int s = 0; s < crosspad::MixerPresets::kSlots; ++s) {
+        lv_obj_t* r = make_box(page);
+        lv_obj_set_size(r, LV_PCT(100), kRowH);
+        lv_obj_set_style_bg_color(r, kRowBg, 0);
+        lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(r, 6, 0);
+        lv_obj_set_style_pad_hor(r, 6, 0);
+        lv_obj_set_style_pad_column(r, 4, 0);
+        lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_t* col = make_box(r);
+        lv_obj_set_height(col, kRowH - 2);
+        lv_obj_set_flex_grow(col, 1);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        s_pre[s].name = lv_label_create(col);
+        lv_obj_set_style_text_font(s_pre[s].name, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_pre[s].name, kText, 0);
+        lv_label_set_text(s_pre[s].name, "");
+        s_pre[s].sub = lv_label_create(col);
+        lv_obj_set_style_text_font(s_pre[s].sub, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(s_pre[s].sub, kDim, 0);
+        lv_label_set_text(s_pre[s].sub, "");
+        s_pre[s].load = make_button(r, 58, 24, "LOAD", load_cb, (void*)(intptr_t)s);
+        lv_obj_set_style_bg_color(s_pre[s].load, kAccent, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_pre[s].load, 0), kInk, 0);
+        lv_obj_set_style_bg_opa(s_pre[s].load, LV_OPA_30, LV_STATE_DISABLED);
+        s_pre[s].save = make_button(r, 58, 24, LV_SYMBOL_SAVE " SAVE", save_cb, (void*)(intptr_t)s);
+    }
+}
+
 bool back_handler(lv_obj_t*)
 {
+    if (s_nameOv) { close_name(); return true; }
     if (s_detail) { close_detail(); return true; }
     return false;
 }
@@ -977,6 +1168,7 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
         build_row(s_pages[kOut], s_rowCount++, true, o, kOut);
     }
     build_route(s_pages[kRoute]);
+    build_presets(s_pages[kPresets]);
 
     /* The categories, along the bottom where the thumb is. */
     lv_obj_t* tabs = make_box(s_root);
@@ -985,9 +1177,9 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_pad_column(tabs, 4, 0);
     s_back = make_button(tabs, 36, kTabH, LV_SYMBOL_LEFT, back_cb, app);
     /* Shared out by how long the names are, so SOURCES and ROUTE fit. */
-    static const uint8_t kTabGrow[kPages] = {2, 3, 2, 3};
+    static const uint8_t kTabGrow[kPages] = {2, 3, 2, 3, 0};
     for (int p = 0; p < kPages; ++p) {
-        s_tabs[p] = make_button(tabs, 10, kTabH, kPageNames[p], tab_cb, (void*)(intptr_t)p);
+        s_tabs[p] = make_button(tabs, 36, kTabH, kPageNames[p], tab_cb, (void*)(intptr_t)p);
         lv_obj_set_flex_grow(s_tabs[p], kTabGrow[p]);
     }
 
@@ -1003,7 +1195,9 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
         app->setOnShow([](lv_obj_t*) {
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef MIXER_USE_ENCODER
-            if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_detailGroup ? s_detailGroup : s_encGroup);
+            if (indev_encoderTop) {
+                lv_indev_set_group(indev_encoderTop, s_nameGroup ? s_nameGroup : (s_detailGroup ? s_detailGroup : s_encGroup));
+            }
 #endif
         });
         app->setOnHide([](lv_obj_t*) {
@@ -1027,7 +1221,12 @@ void Mixer_destroy(lv_obj_t* app_obj)
 
 #ifdef MIXER_USE_ENCODER
     if (s_detailGroup) { lv_group_delete(s_detailGroup); s_detailGroup = nullptr; }
+    if (s_nameGroup) { lv_group_delete(s_nameGroup); s_nameGroup = nullptr; }
 #endif
+    s_nameOv = s_nameText = nullptr;
+    s_nameSlot = -1;
+    for (auto& r : s_pre) r = PresetRow{};
+    s_preStatus = s_preUndo = nullptr;
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
