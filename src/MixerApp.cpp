@@ -365,7 +365,8 @@ void close_detail()
     if (!s_detail) return;
 #ifdef MIXER_USE_ENCODER
     if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
-    if (s_detailGroup) { lv_group_delete(s_detailGroup); s_detailGroup = nullptr; }
+    lv_group_delete_deferred(s_detailGroup);      // Done's click is still being read
+    s_detailGroup = nullptr;
 #endif
     lv_obj_delete_async(s_detail);
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
