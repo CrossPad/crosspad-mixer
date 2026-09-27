@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,10 +11,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=0.3.0",
-    "crosspad-gui": ">=0.2.0"
+    "crosspad-core": ">=1.25.0",
+    "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.4.0: IN / SOURCES / OUT / ROUTE tabs along the bottom, a row per channel with a long fader, the channel window (input gain, pan, sends); requires core 1.25 (IInputGain) and gui 1.14",
     "0.2.1: Merge lvgl.h include fix + PlatformIO library.json with MixerPadLogic registration",
     "0.2.0: Dynamic IAudioNode-based channels (up to 16 × 8 outputs); ESP-IDF build target",
     "0.1.0: Initial release — VU meters, 3x2 routing matrix, volume + mute/solo"
