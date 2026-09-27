@@ -239,10 +239,10 @@ void paint(lv_obj_t* b, bool on, lv_color_t onColor)
 {
     if (!b) return;
     const lv_color_t bg = on ? onColor : kTrack;
-    if (!lv_color_eq(lv_obj_get_style_bg_color(b, 0), bg)) lv_obj_set_style_bg_color(b, bg, 0);
+    if (!lv_color_eq(lv_obj_get_style_bg_color(b, LV_PART_MAIN), bg)) lv_obj_set_style_bg_color(b, bg, 0);
     lv_obj_t* l = lv_obj_get_child(b, 0);
     const lv_color_t ink = on ? kInk : kText;
-    if (l && !lv_color_eq(lv_obj_get_style_text_color(l, 0), ink)) lv_obj_set_style_text_color(l, ink, 0);
+    if (l && !lv_color_eq(lv_obj_get_style_text_color(l, LV_PART_MAIN), ink)) lv_obj_set_style_text_color(l, ink, 0);
 }
 
 /// A horizontal slider with a knob a finger can take: the track thin, the
