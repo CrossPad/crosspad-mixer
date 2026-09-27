@@ -149,6 +149,11 @@ public:
     /// `outBuses[i]` must point to a buffer of `frames * 2` floats. Audio
     /// thread only — single writer.
     void render(float* const* outBuses, uint8_t numOut, uint32_t frames);
+    /// RT, right after render(): the channels in @p chs as they went into the
+    /// mix -- panned, at their fader, silent when muted or left out by a solo
+    /// -- summed into @p out, whatever they are sent to. A tap the routing
+    /// must not decide, such as the pads alone for a bounce.
+    void renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) const;
 
     // ── Tap (CI/test capture) ──────────────────────────────────────────────
 

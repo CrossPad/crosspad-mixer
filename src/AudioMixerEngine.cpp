@@ -307,6 +307,28 @@ void AudioMixerEngine::getOutputLevel(OutputId out, int16_t& left, int16_t& righ
 
 // ── Render (single audio thread) ──────────────────────────────────────────
 
+void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) const {
+    const uint32_t stereo = frames * 2;
+    std::memset(out, 0, stereo * sizeof(float));
+    bool anySoloed = false;
+    for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
+        if (channels_[ch].active.load(std::memory_order_acquire) &&
+            channels_[ch].soloed.load(std::memory_order_relaxed)) { anySoloed = true; break; }
+    }
+    for (uint8_t i = 0; i < n; ++i) {
+        if (chs[i] >= kMixerMaxChannels) continue;
+        const auto& slot = channels_[chs[i]];
+        if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
+        if (slot.muted.load(std::memory_order_relaxed)) continue;
+        if (anySoloed && !slot.soloed.load(std::memory_order_relaxed)) continue;
+        if (slot.scratch.size() < stereo) continue;
+        /* render() left the channel's block in its scratch, already panned. */
+        const float vol = slot.volume.load(std::memory_order_relaxed);
+        const float* src = slot.scratch.data();
+        for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
+    }
+}
+
 void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t frames) {
     if (numOut > numOutputs_) numOut = numOutputs_;
     const uint32_t stereo = frames * 2;
