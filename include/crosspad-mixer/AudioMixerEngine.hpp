@@ -26,12 +26,16 @@
 #include <string>
 #include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
+#include <crosspad/audio/OutputEq.hpp>
 
 namespace crosspad { class IAudioNode; }
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 static constexpr uint8_t kMixerMaxChannels = 16;
 static constexpr uint8_t kMixerMaxOutputs  = 8;
+/// Outputs that can carry an EQ: the first two, which on every board so far
+/// are the speakers and the headphones.
+static constexpr uint8_t kMixerEqOutputs   = 2;
 static constexpr uint8_t kMixerInvalidChannelId = 0xFF;
 static constexpr uint8_t kMixerNameLen = 24;
 
@@ -104,6 +108,23 @@ public:
     /// until the platform says otherwise.
     void setOutputHeard(OutputId out, bool heard);
     bool isOutputHeard(OutputId out) const;
+
+    // ── Output EQ ──────────────────────────────────────────────────────────
+    //
+    // Four bands across an output, for evening out what it plays through: a
+    // speaker this size has a response, and so does a headphone amp, and the
+    // two are not each other's. It sits where a console's monitor EQ sits --
+    // after the mix, before that output's own fader -- so a band that lifts
+    // something leaves the fader to take it back, and nothing downstream of
+    // the correction can undo it.
+    //
+    // Saved with the desk (stateJson), so a board keeps its correction.
+
+    /// Not from the render thread: the coefficients are worked out here.
+    void setOutputEq(OutputId out, const crosspad::EqSettings& eq);
+    crosspad::EqSettings getOutputEq(OutputId out) const;
+    /// Whether that output's EQ is doing anything at all.
+    bool isOutputEqActive(OutputId out) const;
 
     // ── Routing matrix ─────────────────────────────────────────────────────
 
@@ -246,6 +267,11 @@ private:
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
+    /* One per output that can be EQ'd -- the ones a board plays through, not
+     * all eight slots. Internal RAM on this hardware is counted in hundreds
+     * of bytes at boot (see EqChain), and an EQ across a recording bus is
+     * not a thing anybody asked for. */
+    crosspad::EqChain outputEq_[kMixerEqOutputs];
 
     std::atomic<crosspad::AudioRingBuffer<int16_t>*> tapBuffer_{nullptr};
     std::atomic<uint8_t> tapOutput_{0};

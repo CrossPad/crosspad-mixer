@@ -38,6 +38,8 @@ AudioMixerEngine::~AudioMixerEngine() = default;
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
+    for (auto& eq : outputEq_) eq.setRate(sampleRate);
+
     frameCount_ = frameCount;
     sampleRate_ = sampleRate;
     if (numOutputs == 0) numOutputs = 1;
@@ -159,6 +161,25 @@ const char* AudioMixerEngine::getOutputName(OutputId out) const {
 
 void AudioMixerEngine::setOutputHeard(OutputId out, bool heard) {
     if (out < kMixerMaxOutputs) outputs_[out].heard.store(heard, std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::setOutputEq(OutputId out, const crosspad::EqSettings& eq) {
+    if (out >= kMixerEqOutputs) return;
+    outputEq_[out].set(eq);
+    /* No notify: in this engine a setter changes the desk and whoever was
+     * turning the knobs says when it is worth saving (MixerApp on its close,
+     * the presets, a host command). Serialising it here meant a CDC verb
+     * doing it on the main task's four kilobytes of stack, inside
+     * ArduinoJson's allocator -- which is exactly where it ended. */
+}
+
+crosspad::EqSettings AudioMixerEngine::getOutputEq(OutputId out) const {
+    if (out >= kMixerEqOutputs) return {};
+    return outputEq_[out].settings();
+}
+
+bool AudioMixerEngine::isOutputEqActive(OutputId out) const {
+    return out < kMixerEqOutputs && outputEq_[out].on();
 }
 
 bool AudioMixerEngine::isOutputHeard(OutputId out) const {
@@ -426,7 +447,12 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
 
         if (oMuted) {
             std::memset(dst, 0, stereo * sizeof(float));
+            /* The sections forget where they were: coming back from mute
+             * should not play out what was in them a minute ago. */
+            if (o < kMixerEqOutputs) outputEq_[o].reset();
         } else {
+            /* The correction, then the fader. */
+            if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
 #if CROSSPAD_MIXER_USE_ESP_DSP
             dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
 #else
@@ -515,6 +541,21 @@ std::string AudioMixerEngine::stateJson() const {
         JsonObject ob = outArr.add<JsonObject>();
         ob["volume"] = outputs_[o].volume.load(std::memory_order_relaxed);
         ob["muted"]  = outputs_[o].muted .load(std::memory_order_relaxed);
+        const crosspad::EqSettings eq = o < kMixerEqOutputs ? outputEq_[o].settings()
+                                                             : crosspad::EqSettings{};
+        /* Only when there is something to say: a desk that has never had an
+         * EQ set keeps the blob the size it was. */
+        if (eq.on || eq.any()) {
+            ob["eqOn"] = eq.on;
+            JsonArray bands = ob["eq"].to<JsonArray>();
+            for (const auto& b : eq.band) {
+                JsonObject bo = bands.add<JsonObject>();
+                bo["kind"] = (int)b.kind;
+                bo["hz"]   = b.hz;
+                bo["db"]   = b.gainDb;
+                bo["q"]    = b.q;
+            }
+        }
     }
 
     std::string out;
@@ -556,6 +597,27 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         if (idx >= kMixerMaxOutputs) break;
         outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
         outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
+        /* Only a desk that has an EQ in it asks for one: an EQ's state is
+         * taken on first use, and a board that has never set one should not
+         * pay for it at boot. */
+        if (!ob["eq"].is<JsonArrayConst>() && !(ob["eqOn"] | false)) { ++idx; continue; }
+        crosspad::EqSettings eq;
+        eq.on = ob["eqOn"] | false;
+        int bi = 0;
+        /* Named, not iterated off the subscript: the range expression would
+         * be a temporary and the view into it a dangling reference. */
+        JsonArrayConst bands = ob["eq"];
+        for (JsonObjectConst bo : bands) {
+            if (bi >= crosspad::kEqBands) break;
+            crosspad::EqBand& b = eq.band[bi++];
+            const int kind = bo["kind"] | 0;
+            b.kind   = kind >= 0 && kind <= (int)crosspad::EqKind::LowPass
+                           ? (crosspad::EqKind)kind : crosspad::EqKind::Off;
+            b.hz     = bo["hz"] | 1000.0f;
+            b.gainDb = bo["db"] | 0.0f;
+            b.q      = bo["q"]  | 0.7f;
+        }
+        if (idx < kMixerEqOutputs) outputEq_[idx].set(eq);
         ++idx;
     }
     return true;

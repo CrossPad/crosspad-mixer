@@ -399,12 +399,49 @@ void rebuild_group();
 void add_presets_to_group();
 void refresh_presets();
 
+/* An output's window is its tone: three bands across what that output plays
+ * through, which is what evening out a speaker or a pair of headphones takes.
+ * The shapes are fixed and the sliders are their gain -- a correction is a
+ * few dB in the right place, not a design exercise -- and the fourth band,
+ * and any shape at all, is there over CDC (MIX_EQ) for the fine work. */
+constexpr int kToneBands = 3;
+const struct ToneBand {
+    const char*      label;
+    crosspad::EqKind kind;
+    float            hz;
+    float            q;
+} kTone[kToneBands] = {
+    {"Low",  crosspad::EqKind::LowShelf,   160.0f, 0.70f},
+    {"Mid",  crosspad::EqKind::Peak,      1200.0f, 1.00f},
+    {"High", crosspad::EqKind::HighShelf, 5000.0f, 0.70f},
+};
+
+lv_obj_t* s_dEq[kToneBands] = {};
+lv_obj_t* s_dEqLabel[kToneBands] = {};
+
 void detail_labels()
 {
     if (s_detailRow < 0 || !s_detail) return;
     const Row& r = s_rows[s_detailRow];
     auto& m = getMixerEngine();
     char buf[48];
+    if (r.output) {
+        /* "Low   +3 dB", and the shape under the name of the band. */
+        const crosspad::EqSettings eq = m.getOutputEq(r.id);
+        for (int b = 0; b < kToneBands; ++b) {
+            if (!s_dEqLabel[b]) continue;
+            const int db = (int)lroundf(eq.band[b].gainDb);
+            const float hz = kTone[b].hz;
+            if (hz >= 1000.0f) {
+                std::snprintf(buf, sizeof(buf), "%-5s %+3d dB   %.1f kHz", kTone[b].label, db,
+                              (double)(hz / 1000.0f));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%-5s %+3d dB   %d Hz", kTone[b].label, db, (int)hz);
+            }
+            set_text(s_dEqLabel[b], buf);
+        }
+        return;
+    }
     if (s_dGainLabel && gains() && s_gainInput >= 0) {
         const float db = gains()->gainDb(s_gainInput);
         std::snprintf(buf, sizeof(buf), "Gain  +%.0f dB", (double)db);
@@ -456,6 +493,38 @@ void dsend_cb(lv_event_t* e)
     detail_labels();
 }
 
+
+void eq_band_cb(lv_event_t* e)
+{
+    const int b = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_detailRow < 0 || b < 0 || b >= kToneBands || !s_dEq[b]) return;
+    auto& m = getMixerEngine();
+    const uint8_t out = s_rows[s_detailRow].id;
+    crosspad::EqSettings eq = m.getOutputEq(out);
+    crosspad::EqBand& band = eq.band[b];
+    band.kind   = kTone[b].kind;
+    band.hz     = kTone[b].hz;
+    band.q      = kTone[b].q;
+    band.gainDb = (float)lv_slider_get_value(s_dEq[b]);
+    eq.on = true;
+    m.setOutputEq(out, eq);
+    detail_labels();
+}
+
+void eq_flat_cb(lv_event_t*)
+{
+    if (s_detailRow < 0) return;
+    auto& m = getMixerEngine();
+    const uint8_t out = s_rows[s_detailRow].id;
+    crosspad::EqSettings eq = m.getOutputEq(out);
+    for (int b = 0; b < kToneBands; ++b) {
+        eq.band[b].gainDb = 0.0f;
+        if (s_dEq[b]) lv_slider_set_value(s_dEq[b], 0, LV_ANIM_OFF);
+    }
+    m.setOutputEq(out, eq);
+    detail_labels();
+}
+
 void close_detail()
 {
     if (!s_detail) return;
@@ -466,6 +535,8 @@ void close_detail()
 #endif
     lv_obj_delete_async(s_detail);
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
+    for (auto& o : s_dEq) o = nullptr;
+    for (auto& o : s_dEqLabel) o = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
     for (auto& s : s_dMon) s = nullptr;
@@ -496,7 +567,10 @@ lv_obj_t* detail_slider(int32_t min, int32_t max, int32_t v, lv_color_t fill, lv
 
 void open_detail(int idx)
 {
-    if (s_detail || idx < 0 || idx >= s_rowCount || s_rows[idx].output) return;
+    if (s_detail || idx < 0 || idx >= s_rowCount) return;
+    /* An output opens too, for its tone -- but only one that can carry an
+     * EQ (the ones a board plays through). */
+    if (s_rows[idx].output && s_rows[idx].id >= kMixerEqOutputs) return;
     const Row& r = s_rows[idx];
     auto& m = getMixerEngine();
     const Look* look = look_for(m.getChannelName(r.id));
@@ -522,8 +596,41 @@ void open_detail(int idx)
 
     lv_obj_t* title = lv_label_create(s_detail);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, color, 0);
-    lv_label_set_text(title, look ? look->label : m.getChannelName(r.id));
+    lv_obj_set_style_text_color(title, r.output ? kAccent : color, 0);
+    lv_label_set_text(title, r.output ? m.getOutputName(r.id)
+                                      : (look ? look->label : m.getChannelName(r.id)));
+
+    if (r.output) {
+        lv_obj_t* hint = lv_label_create(s_detail);
+        lv_obj_set_width(hint, LV_PCT(94));
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(hint, kDim, 0);
+        lv_label_set_text_fmt(hint, "tone of the %s   .   160 Hz shelf, 1.2 kHz, 5 kHz shelf",
+                              output_role(m.getOutputName(r.id)));
+        const crosspad::EqSettings eq = m.getOutputEq(r.id);
+        for (int b = 0; b < kToneBands; ++b) {
+            detail_line("", &s_dEqLabel[b]);
+            s_dEq[b] = detail_slider(-12, 12, (int32_t)lroundf(eq.band[b].gainDb),
+                                     kAccent, eq_band_cb, (void*)(intptr_t)b);
+            lv_slider_set_mode(s_dEq[b], LV_SLIDER_MODE_SYMMETRICAL);
+        }
+        lv_obj_t* flat = make_button(s_detail, 96, 26, "FLAT", eq_flat_cb, nullptr,
+                                     &lv_font_montserrat_10);
+        lv_obj_t* done = make_button(s_detail, 120, 28, LV_SYMBOL_OK " Done",
+                                     [](lv_event_t*) { close_detail(); }, nullptr);
+        lv_obj_set_style_bg_color(done, kAccent, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(done, 0), kInk, 0);
+#ifdef MIXER_USE_ENCODER
+        if (s_detailGroup) {
+            lv_group_add_obj(s_detailGroup, flat);
+            lv_group_add_obj(s_detailGroup, done);
+            lv_group_focus_obj(s_dEq[0]);
+        }
+#endif
+        detail_labels();
+        return;
+    }
 
     if (s_gainInput >= 0) {
         auto* g = gains();
@@ -612,7 +719,9 @@ void rebuild_group()
         for (int i = 0; i < s_rowCount; ++i) {
             const Row& r = s_rows[i];
             if (r.page != s_page) continue;
-            if (!r.output) add_to_group(r.name);          // outputs have no window
+            /* An output's name opens its tone, so it belongs in the walk --
+             * but only an output that can carry an EQ. */
+            if (!r.output || r.id < kMixerEqOutputs) add_to_group(r.name);
             if (!lv_obj_has_state(r.fader, LV_STATE_DISABLED)) add_to_group(r.fader);
             add_to_group(r.mute);
             add_to_group(r.solo);
@@ -966,7 +1075,11 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     lv_obj_set_style_outline_width(r.name, 2, LV_STATE_FOCUS_KEY);
     lv_obj_set_flex_flow(r.name, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(r.name, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    if (!output) lv_obj_add_event_cb(r.name, name_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    /* An output opens its tone; a channel opens the rest of itself. The
+     * outputs that carry no EQ (a recording bus) open nothing. */
+    if (!output || id < kMixerEqOutputs) {
+        lv_obj_add_event_cb(r.name, name_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    }
     lv_obj_t* nl = lv_label_create(r.name);
     lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(nl, color, 0);
@@ -1228,6 +1341,8 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& r : s_pre) r = PresetRow{};
     s_preStatus = s_preUndo = nullptr;
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
+    for (auto& o : s_dEq) o = nullptr;
+    for (auto& o : s_dEqLabel) o = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
     for (auto& s : s_dMon) s = nullptr;
