@@ -162,7 +162,17 @@ lv_obj_t* s_dMon[kMaxMonChoices] = {};
 uint32_t  s_dMonMask[kMaxMonChoices] = {};
 int       s_gainInput = -1;          // IInputGain index of the channel in the window
 constexpr int kMaxSrcChoices = 4;    // sockets sharing one converter; CrossPad has 2
-lv_obj_t* s_dSrc[kMaxSrcChoices] = {};   // the Source switch in the channel window
+/* In PSRAM: this board reserves its 64 kB DMA pool after the static data is
+ * placed and boots with under 150 bytes of internal RAM to spare, so a new
+ * array of pointers here is enough to abort main_task. Touched only from the
+ * LVGL thread, never with the cache off. */
+#ifdef ESP_PLATFORM
+  #include "esp_attr.h"
+  EXT_RAM_BSS_ATTR lv_obj_t* s_dSrc[kMaxSrcChoices];
+#else
+  lv_obj_t* s_dSrc[kMaxSrcChoices] = {};
+#endif
+
 
 #ifdef MIXER_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
