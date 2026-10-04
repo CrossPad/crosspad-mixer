@@ -575,9 +575,27 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         if (id < 0 || id >= kMixerMaxChannels) continue;
         auto& slot = channels_[id];
         /* By slot and by name: a build that registers its channels in another
-         * order must not hand one channel's settings to a different one. */
+         * order must not hand one channel's settings to a different one.
+         *
+         * A channel that was only *renamed* keeps its settings, through the
+         * table below: the slot is the same, so the guard would otherwise
+         * throw away a desk saved before the rename. Entries go in pairs,
+         * old name then new. */
+        static const char* const kRenamed[][2] = {
+            {"IN1", "Mic"},     // the built-in mics
+            {"IN2", "Line"},    // the line-in jacks
+        };
         const char* name = c["name"] | "";
-        if (slot.name[0] && name[0] && std::strcmp(slot.name, name) != 0) continue;
+        if (slot.name[0] && name[0] && std::strcmp(slot.name, name) != 0) {
+            bool renamed = false;
+            for (const auto& r : kRenamed) {
+                if (std::strcmp(name, r[0]) == 0 && std::strcmp(slot.name, r[1]) == 0) {
+                    renamed = true;
+                    break;
+                }
+            }
+            if (!renamed) continue;
+        }
         slot.volume.store(c["volume"] | 1.0f, std::memory_order_relaxed);
         slot.muted .store(c["muted"]  | false, std::memory_order_relaxed);
         slot.soloed.store(c["soloed"] | false, std::memory_order_relaxed);

@@ -161,6 +161,8 @@ constexpr int kMaxMonChoices = kMixerMaxOutputs + 2;   // off, each heard output
 lv_obj_t* s_dMon[kMaxMonChoices] = {};
 uint32_t  s_dMonMask[kMaxMonChoices] = {};
 int       s_gainInput = -1;          // IInputGain index of the channel in the window
+constexpr int kMaxSrcChoices = 4;    // sockets sharing one converter; CrossPad has 2
+lv_obj_t* s_dSrc[kMaxSrcChoices] = {};   // the Source switch in the channel window
 
 #ifdef MIXER_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
@@ -542,6 +544,7 @@ void close_detail()
     for (auto& s : s_dMon) s = nullptr;
     s_detailRow = -1;
     s_gainInput = -1;
+    for (auto& b : s_dSrc) b = nullptr;
 }
 
 lv_obj_t* detail_line(const char* text, lv_obj_t** label)
@@ -630,6 +633,41 @@ void open_detail(int idx)
 #endif
         detail_labels();
         return;
+    }
+
+    if (s_gainInput >= 0 && gains()->sources(s_gainInput) >= 2) {
+        /* Two sockets, one converter: the board can only listen to one of
+         * them, so this is a switch rather than a second channel. Changing it
+         * is heard at once -- the routing re-applies the claim. */
+        auto* g = gains();
+        detail_line("Source", nullptr);
+        lv_obj_t* seg = make_box(s_detail);
+        lv_obj_set_size(seg, LV_PCT(94), 28);
+        lv_obj_set_flex_flow(seg, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(seg, 4, 0);
+        const int cur = g->source(s_gainInput);
+        for (int i = 0; i < g->sources(s_gainInput) && i < kMaxSrcChoices; ++i) {
+            lv_obj_t* b = make_button(seg, 10, 28, g->sourceName(s_gainInput, i), [](lv_event_t* e) {
+                const int k = (int)(intptr_t)lv_event_get_user_data(e);
+                if (s_gainInput < 0 || !gains()) return;
+                gains()->setSource(s_gainInput, k);
+                for (int j = 0; j < kMaxSrcChoices; ++j) {
+                    if (!s_dSrc[j]) continue;
+                    const bool on = j == gains()->source(s_gainInput);
+                    lv_obj_set_style_bg_color(s_dSrc[j], on ? kAccent : kRowBg, 0);
+                    lv_obj_set_style_text_color(lv_obj_get_child(s_dSrc[j], 0), on ? kInk : kText, 0);
+                }
+            }, (void*)(intptr_t)i);
+            lv_obj_set_flex_grow(b, 1);
+            if (i == cur) {
+                lv_obj_set_style_bg_color(b, kAccent, 0);
+                lv_obj_set_style_text_color(lv_obj_get_child(b, 0), kInk, 0);
+            }
+#ifdef MIXER_USE_ENCODER
+            if (s_detailGroup) lv_group_add_obj(s_detailGroup, b);
+#endif
+            s_dSrc[i] = b;
+        }
     }
 
     if (s_gainInput >= 0) {
