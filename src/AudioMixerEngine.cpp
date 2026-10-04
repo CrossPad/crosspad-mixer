@@ -20,8 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
-#include <fstream>
-#include <iterator>
+#include <memory>
 #include <string>
 
 AudioMixerEngine::AudioMixerEngine() {
@@ -571,14 +570,14 @@ void AudioMixerEngine::saveState(const std::string& path) const {
     const std::string tmpPath = path + ".tmp";
     const std::string bakPath = path + ".bak";
     {
-        std::ofstream f(tmpPath);
-        if (!f.is_open()) {
+        FILE* f = std::fopen(tmpPath.c_str(), "w");
+        if (!f) {
             printf("[Mixer] Failed to save state to %s\n", tmpPath.c_str());
             return;
         }
-        f << json;
-        f.close();                      // a full disk shows up on the flush
-        if (!f) {
+        const bool wrote = std::fwrite(json.data(), 1, json.size(), f) == json.size();
+        const bool closed = std::fclose(f) == 0;    // a full disk shows up on the flush
+        if (!wrote || !closed) {
             printf("[Mixer] Failed to write %s\n", tmpPath.c_str());
             std::remove(tmpPath.c_str());
             return;
@@ -596,12 +595,36 @@ void AudioMixerEngine::saveState(const std::string& path) const {
     printf("[Mixer] State saved to %s\n", path.c_str());
 }
 
+namespace {
+
+struct FileCloser {
+    void operator()(FILE* f) const { std::fclose(f); }
+};
+
+/// The whole file, or false if it would not open. The handle is owned while
+/// the string grows, so a bad_alloc cannot leak it.
+bool readFile(const std::string& path, std::string& out) {
+    std::unique_ptr<FILE, FileCloser> f(std::fopen(path.c_str(), "r"));
+    if (!f) return false;
+    out.clear();
+    constexpr size_t kChunk = 512;
+    for (;;) {
+        const size_t had = out.size();
+        out.resize(had + kChunk);
+        const size_t n = std::fread(&out[had], 1, kChunk, f.get());
+        out.resize(had + n);
+        if (n < kChunk) break;
+    }
+    return true;
+}
+
+} // namespace
+
 void AudioMixerEngine::loadState(const std::string& path) {
+    std::string json;
     for (const char* suffix : {"", ".tmp", ".bak"}) {
         const std::string p = path + suffix;
-        std::ifstream f(p);
-        if (!f.is_open()) continue;
-        const std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (!readFile(p, json)) continue;
         if (!applyStateJson(json)) {
             printf("[Mixer] State parse error in %s\n", p.c_str());
             continue;
