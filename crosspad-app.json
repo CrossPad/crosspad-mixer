@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Audio mixer/router \u2014 dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.9.0: IN reads USB in, In 1/2, In 3/4, Mic. The two line sockets share one converter, so they are two rows over one channel: the one the converter is on is live, the other is dimmed, and tapping it makes it live. Also fixes the page they were filed under -- the look-up table still said IN1/IN2 after the platform renamed the channels Mic and Line, which quietly put both on SOURCES.",
     "0.8.0: a Source switch in the channel window for an input whose board gives it a choice -- on CrossPad the two line-in jacks share one converter, so Line picks In 1/2 or In 3/4. Needs core 1.43 (IInputGain::sources/setSource).",
     "0.7.0: AudioMixerEngine::renderTap() -- chosen channels as the mix has them (fader, pan, mute, solo) summed after render, whatever they are sent to: the platform records a bounce from the pads alone, not from a bus the inputs can reach",
     "0.6.0: PRESETS (the list tab) -- the whole desk (levels, mutes, pan, sends, outputs, input gain) saved under a name on the card, loaded back, UNDO for the last load; STREAM, BEATS and SAMPLING start as a starting point for their name; MixerPresets, the platform names the folder",

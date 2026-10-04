@@ -91,9 +91,13 @@ const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", LV_SYMB
 /// How a channel is named, coloured and filed, by the name it registers under.
 struct Look { const char* name; const char* label; uint32_t color; Page page; };
 const Look kLooks[] = {
-    {"IN1",     "Mic",     0xB48CFF, kIn},
-    {"IN2",     "Line",    0xFF9552, kIn},
+    /* IN, in the order a player reads it: what the computer sends, then the
+     * two line sockets, then the mics. The channels are named Mic and Line
+     * by the platform -- they used to be IN1 and IN2, and this table was not
+     * renamed with them, which quietly filed both onto SOURCES. */
     {"USB",     "USB in",  0xFFC857, kIn},
+    {"Line",    "Line in", 0xFF9552, kIn},
+    {"Mic",     "Mic",     0xB48CFF, kIn},
     {"Sampler", "Sampler", 0xC6FF47, kSources},
     {"Pitched", "Pitched", 0x5AC8FF, kSources},
     {"Click",   "Click",   0xFF7A9A, kSources},
@@ -121,6 +125,11 @@ const char* output_role(const char* name)
 struct Row {
     bool      output = false;
     uint8_t   id = 0;            // channel id, or output id
+    /* Which socket this row is, for a channel that has more than one: the
+     * board wires both line-in jacks to one converter, so "Line in 1/2" and
+     * "Line in 3/4" are two rows over one channel and only the one that is
+     * selected is live. -1 for every other row. */
+    int8_t    src = -1;
     Page      page = kSources;
     lv_obj_t* box = nullptr;
     lv_obj_t* name = nullptr;    // the button that opens the channel
@@ -738,7 +747,27 @@ void open_detail(int idx)
     detail_labels();
 }
 
-void name_cb(lv_event_t* e) { open_detail((int)(intptr_t)lv_event_get_user_data(e)); }
+/// Which socket a row's channel is listening to, or -1 where there is no choice.
+int live_src_of(uint8_t ch)
+{
+    const int gi = gain_input_of(ch);
+    if (gi < 0 || !gains() || gains()->sources(gi) < 2) return -1;
+    return gains()->source(gi);
+}
+
+void name_cb(lv_event_t* e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rowCount) return;
+    const Row& r = s_rows[idx];
+    /* One converter, two sockets: a tap on the one that is not live makes it
+     * live rather than opening a channel the row does not really own yet. */
+    if (r.src >= 0 && live_src_of(r.id) != r.src) {
+        if (gains()) gains()->setSource(gain_input_of(r.id), r.src);
+        return;
+    }
+    open_detail(idx);
+}
 
 // ── pages ──────────────────────────────────────────────────────────────────
 
@@ -1007,6 +1036,12 @@ void tick_row(Row& r, bool anySolo)
         m.getOutputLevel(r.id, l, rr);        // already post-master
         gain = m.getOutputVolume(r.id);
         muted = m.isOutputMuted(r.id);
+    } else if (r.src >= 0 && live_src_of(r.id) != r.src) {
+        /* Not the socket the converter is on: no signal can reach this row,
+         * so it shows none rather than mirroring its twin. */
+        l = rr = 0.0f;
+        gain = m.getChannelVolume(r.id);
+        muted = true;
     } else {
         m.getChannelLevel(r.id, l, rr);       // pre-fader: fader it here
         gain = m.getChannelVolume(r.id);
@@ -1087,7 +1122,7 @@ void tick_cb(lv_timer_t*)
 
 // ── building ───────────────────────────────────────────────────────────────
 
-void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
+void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int8_t src = -1)
 {
     auto& m = getMixerEngine();
     Row& r = s_rows[idx];
@@ -1095,9 +1130,11 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     r.output = output;
     r.id = id;
     r.page = where;
+    r.src = src;
 
     const Look* look = output ? nullptr : look_for(m.getChannelName(id));
     const char* label = output ? m.getOutputName(id) : (look ? look->label : m.getChannelName(id));
+    if (src >= 0) label = gains() ? gains()->sourceName(gain_input_of(id), src) : "Line";
     const lv_color_t color = output ? kText : (look ? lv_color_hex(look->color) : kText);
 
     r.box = make_box(page);
@@ -1314,7 +1351,19 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     auto place = [&](uint8_t ch) {
         const Look* look = look_for(m.getChannelName(ch));
         const Page where = look ? look->page : kSources;
-        build_row(s_pages[where], s_rowCount++, false, ch, where);
+        /* A channel whose input offers a choice of socket gets one row per
+         * socket: the board shows both line-in jacks even though only the
+         * selected one is live, because "where do I plug in" is the question
+         * a mixer should answer without opening anything. */
+        const int gi = gain_input_of(ch);
+        const int sockets = (gi >= 0 && gains()) ? gains()->sources(gi) : 0;
+        if (sockets >= 2) {
+            for (int k = 0; k < sockets && s_rowCount < kMaxRows; ++k) {
+                build_row(s_pages[where], s_rowCount++, false, ch, where, (int8_t)k);
+            }
+        } else {
+            build_row(s_pages[where], s_rowCount++, false, ch, where);
+        }
         s_sources[s_sourceCount++] = ch;
     };
     for (const Look& l : kLooks) {
