@@ -321,7 +321,9 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
         if (slot.muted.load(std::memory_order_relaxed)) continue;
         if (anySoloed && !slot.soloed.load(std::memory_order_relaxed)) continue;
         if (slot.scratch.size() < stereo) continue;
-        /* render() left the channel's block in its scratch, already panned. */
+        /* render() left the channel's block in its scratch, panned -- or, for a
+         * block it did not send (peak 0), unpanned: ±0 either way, the same
+         * bits once summed. A block of NaN and zeros is summed as it is. */
         const float vol = slot.volume.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
         for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
@@ -334,7 +336,8 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
 
     // 1. Pull each active channel via its IAudioNode::mix() into per-channel
     //    scratch (cleared first because mix() is additive). Update per-channel
-    //    peak from the rendered scratch.
+    //    peak from the rendered scratch, and note which channels sounded.
+    uint32_t sounded = 0;   // bit per channel: a peak above 0 this block
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
         if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
@@ -351,6 +354,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         }
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
+        if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
     }
 
     // 2. Solo arbitration
@@ -382,6 +386,16 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (slot.muted.load(std::memory_order_relaxed)) continue;
         const bool soloed = slot.soloed.load(std::memory_order_relaxed);
         if (anySoloed && !soloed) continue;
+
+        /* A peak of 0 is a block of ±0: panned and sent at any finite gain
+         * it adds ±0 to buses that start at +0, and every bus comes out bit
+         * for bit as it was. So it is neither panned nor sent -- a silent
+         * Click, Song, Preview or USB channel costs no pass per send. Its
+         * node was pulled and its meter set above, and renderTap() reads the
+         * same zeros unpanned. NaN slips past the peak, so a block of only
+         * NaN and zeros is kept off the buses too instead of poisoning every
+         * one (renderTap() still sums it as it is). */
+        if (!(sounded & (1u << ch))) continue;
 
         /* Pan once, in the channel's own scratch, before it is sent anywhere:
          * every send then carries the same placement, as on a desk. After the
