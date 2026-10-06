@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.7.2",
+  "version": "0.8.1",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,11 +11,12 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.25.0",
+    "crosspad-core": ">=1.44.0",
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
-    "0.7.2: render() neither pans nor sends a channel whose block is silent (peak 0) -- the buses come out bit for bit the same, and every quiet channel saves two passes per send; a block of only NaN and zeros no longer reaches the buses (renderTap() still sums it); host tests in tests/, the scalar and the esp-dsp path",
+    "0.8.1 (0.7.2 merged in): render() neither pans nor sends a channel whose block is silent (peak 0) -- the buses come out bit for bit the same, and every quiet channel saves two passes per send; a block of only NaN and zeros no longer reaches the buses (renderTap() still sums it); host tests in tests/, the scalar and the esp-dsp path",
+    "0.8.0: the input pair on IN (IInputPairs, core 1.44.0): Mic + 1/2, Mic + 3/4, 1/2 + 3/4 where the board has three inputs on two ADCs; Line 1/2 and Line 3/4 as their own rows on IN and ROUTE, the input left out dimmed with its gain and sends kept",
     "0.7.1: saveState()/loadState() through stdio instead of fstream (smaller firmware image); same file, same .tmp/.bak commit and fallback",
     "0.7.0: AudioMixerEngine::renderTap() -- chosen channels as the mix has them (fader, pan, mute, solo) summed after render, whatever they are sent to: the platform records a bounce from the pads alone, not from a bus the inputs can reach",
     "0.6.0: PRESETS (the list tab) -- the whole desk (levels, mutes, pan, sends, outputs, input gain) saved under a name on the card, loaded back, UNDO for the last load; STREAM, BEATS and SAMPLING start as a starting point for their name; MixerPresets, the platform names the folder",
