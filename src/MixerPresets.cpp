@@ -82,18 +82,21 @@ struct Factory { const Send* sends; size_t count; };
 const Send kStream[] = {
     {"Sampler", 1, 1, 1}, {"Pitched", 1, 1, 1}, {"Song", 1, 1, 1}, {"Preview", 1, 1, 0},
     {"Click",   0, 1, 0}, {"USB",     0, 1, 0}, {"IN1",  0, 1, 1}, {"IN2",     0, 1, 1},
+    {"IN3",     0, 1, 1},
 };
 /* Beats: everything the board plays on both outputs, the click too, the
  * inputs off; the recording bus gets the pads. */
 const Send kBeats[] = {
     {"Sampler", 1, 1, 1}, {"Pitched", 1, 1, 1}, {"Song", 1, 1, 0}, {"Preview", 1, 1, 0},
     {"Click",   1, 1, 0}, {"USB",     1, 1, 0}, {"IN1",  0, 0, 0}, {"IN2",     0, 0, 0},
+    {"IN3",     0, 0, 0},
 };
 /* Sampling: the computer's sound in the phones (the Recorder takes it before
  * the mixer anyway), auditions on both, no click. */
 const Send kSampling[] = {
     {"Sampler", 1, 1, 1}, {"Pitched", 1, 1, 1}, {"Song", 1, 1, 0}, {"Preview", 1, 1, 0},
     {"Click",   0, 0, 0}, {"USB",     0, 1, 0}, {"IN1",  0, 0, 0}, {"IN2",     0, 0, 0},
+    {"IN3",     0, 0, 0},
 };
 const Factory kFactory[MixerPresets::kSlots] = {
     {kStream, sizeof(kStream) / sizeof(Send)},
