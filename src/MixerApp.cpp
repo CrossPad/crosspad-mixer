@@ -4,11 +4,14 @@
  *
  * The categories are tabs along the bottom, one page each:
  *
- *   IN       what comes into the board: the mics, the line-in jack, USB audio
- *            from the host. The mics and the jack carry their input GAIN, and
- *            each input its MONITOR: which of the outputs you hear -- 1/2,
- *            3/4, both or neither (the outputs the engine marks heard; a
- *            recording bus keeps its own send).
+ *   IN       what comes into the board: the mics, the line-in jacks, USB
+ *            audio from the host. The mics and the jacks carry their input
+ *            GAIN, and each input its MONITOR: which of the outputs you hear
+ *            -- 1/2, 3/4, both or neither (the outputs the engine marks heard;
+ *            a recording bus keeps its own send). Where the board has more
+ *            inputs than ADCs, the PAIR on top picks the two it hears; the
+ *            input left out stays on the desk, dimmed, its gain and sends
+ *            kept for when a pair takes it back.
  *   SOURCES  what the board plays: the sampler, the pitched instrument, the
  *            click, the song, the recorder's and slicer's preview.
  *   OUT      the masters: speakers, phones, the USB recording bus.
@@ -40,6 +43,7 @@
 
 #include "crosspad/app/AppRegistrar.hpp"
 #include "crosspad/audio/IInputGain.hpp"
+#include "crosspad/audio/IInputPairs.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
@@ -91,8 +95,9 @@ const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", LV_SYMB
 /// How a channel is named, coloured and filed, by the name it registers under.
 struct Look { const char* name; const char* label; uint32_t color; Page page; };
 const Look kLooks[] = {
-    {"IN1",     "Mic",     0xB48CFF, kIn},
-    {"IN2",     "Line",    0xFF9552, kIn},
+    {"IN1",     "Mic",      0xB48CFF, kIn},
+    {"IN2",     "Line 1/2", 0xFF9552, kIn},
+    {"IN3",     "Line 3/4", 0xFFCF99, kIn},
     {"USB",     "USB in",  0xFFC857, kIn},
     {"Sampler", "Sampler", 0xC6FF47, kSources},
     {"Pitched", "Pitched", 0x5AC8FF, kSources},
@@ -140,6 +145,9 @@ uint8_t   s_sources[kMixerMaxChannels];   // ROUTE's rows: every channel
 int       s_sourceCount = 0;
 lv_obj_t* s_sends[kMixerMaxChannels][kMixerMaxOutputs] = {};
 lv_obj_t* s_sendLabels[kMixerMaxChannels][kMixerMaxOutputs] = {};
+lv_obj_t* s_routeRows[kMixerMaxChannels] = {};
+constexpr int kMaxPairs = 4;
+lv_obj_t* s_pairs[kMaxPairs] = {};       // IN: the input pair, one button each
 
 lv_obj_t* s_root = nullptr;
 lv_obj_t* s_pages[kPages] = {};
@@ -169,6 +177,22 @@ lv_group_t* s_detailGroup = nullptr;
 #endif
 
 crosspad::IInputGain* gains() { return crosspad::getPlatformServices().inputGain; }
+crosspad::IInputPairs* input_pairs() { return crosspad::getPlatformServices().inputPairs; }
+
+/// Whether mixer channel @p ch hears anything in the input pair: an input
+/// the pair leaves out is on the desk, silent.
+bool connected(uint8_t ch)
+{
+    auto* p = input_pairs();
+    return !p || p->isConnected(getMixerEngine().getChannelName(ch));
+}
+
+/// A row as bright as its channel is live.
+void dim(lv_obj_t* o, bool off)
+{
+    const lv_opa_t opa = off ? LV_OPA_40 : LV_OPA_COVER;
+    if (o && lv_obj_get_style_opa(o, LV_PART_MAIN) != opa) lv_obj_set_style_opa(o, opa, 0);
+}
 
 /// The input-gain index feeding mixer channel @p ch, or -1.
 int gain_input_of(uint8_t ch)
@@ -603,6 +627,9 @@ void rebuild_group()
     if (!s_encGroup) return;
     lv_obj_t* focused = lv_group_get_focused(s_encGroup);
     lv_group_remove_all_objs(s_encGroup);
+    if (s_page == kIn) {
+        for (auto* b : s_pairs) add_to_group(b);
+    }
     if (s_page == kRoute) {
         for (int row = 0; row < s_sourceCount; ++row)
             for (int o = 0; o < kMixerMaxOutputs; ++o) add_to_group(s_sends[row][o]);
@@ -873,9 +900,12 @@ void tick_row(Row& r, bool anySolo)
             if (!lv_color_eq(lv_obj_get_style_text_color(val, LV_PART_MAIN), valInk)) lv_obj_set_style_text_color(val, valInk, 0);
         }
         const int gi = gain_input_of(r.id);
-        if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
-        else         pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
+        const bool live = connected(r.id);
+        if (!live)        std::snprintf(buf, sizeof(buf), "not in pair");
+        else if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
+        else              pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
         set_text(r.sub, buf);
+        dim(r.box, !live);
     }
     paint(r.mute, muted, kMute);
     if (!held(r.fader)) {
@@ -913,8 +943,13 @@ void tick_cb(lv_timer_t*)
     const bool anySolo = m.isAnySoloed();
     if (s_page != kRoute) {
         for (int i = 0; i < s_rowCount; ++i) if (s_rows[i].page == s_page) tick_row(s_rows[i], anySolo);
+        if (s_page == kIn && input_pairs()) {
+            const int cur = input_pairs()->pair();
+            for (int i = 0; i < kMaxPairs; ++i) paint(s_pairs[i], i == cur, kAccent);
+        }
     } else {
         for (int row = 0; row < s_sourceCount; ++row) {
+            dim(s_routeRows[row], !connected(s_sources[row]));
             for (int o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
                 lv_obj_t* sl = s_sends[row][o];
                 if (!sl || held(sl)) continue;
@@ -1077,6 +1112,7 @@ void build_route(lv_obj_t* page)
         const lv_color_t color = look ? lv_color_hex(look->color) : kText;
 
         lv_obj_t* r = make_box(page);
+        s_routeRows[row] = r;
         lv_obj_set_size(r, LV_PCT(100), kRowH);
         lv_obj_set_style_bg_color(r, kRowBg, 0);
         lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
@@ -1122,6 +1158,23 @@ void build_route(lv_obj_t* page)
     }
 }
 
+/// IN's first row: which inputs the ADCs hear, where the board has to choose.
+void build_pairs(lv_obj_t* page)
+{
+    auto* p = input_pairs();
+    if (!p || p->pairs() < 2) return;
+    lv_obj_t* bar = make_box(page);
+    lv_obj_set_size(bar, LV_PCT(100), 26);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(bar, 4, 0);
+    for (int i = 0; i < p->pairs() && i < kMaxPairs; ++i) {
+        s_pairs[i] = make_button(bar, 10, 26, p->pairName(i), [](lv_event_t* e) {
+            if (auto* ip = input_pairs()) ip->setPair((int)(intptr_t)lv_event_get_user_data(e));
+        }, (void*)(intptr_t)i);
+        lv_obj_set_flex_grow(s_pairs[i], 1);
+    }
+}
+
 } // namespace
 
 lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
@@ -1144,9 +1197,10 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int p = 0; p < kPages; ++p) s_pages[p] = make_page(s_root);
+    build_pairs(s_pages[kIn]);
 
-    /* Channels onto their pages in the order kLooks gives them -- Mic, Line,
-     * USB in; Sampler first among the sources -- not the order they were
+    /* Channels onto their pages in the order kLooks gives them -- Mic, the
+     * lines, USB in; Sampler first among the sources -- not the order they were
      * added in; one the table does not know goes last. Outputs onto OUT. */
     s_rowCount = 0;
     s_sourceCount = 0;
@@ -1235,6 +1289,8 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& r : s_rows) r = Row{};
     for (auto& row : s_sends) for (auto& c : row) c = nullptr;
     for (auto& row : s_sendLabels) for (auto& c : row) c = nullptr;
+    for (auto& r : s_routeRows) r = nullptr;
+    for (auto& b : s_pairs) b = nullptr;
     for (auto& p : s_pages) p = nullptr;
     for (auto& t : s_tabs) t = nullptr;
     s_rowCount = s_sourceCount = 0;
