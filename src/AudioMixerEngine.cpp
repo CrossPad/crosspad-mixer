@@ -448,6 +448,20 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         const bool soloed = slot.soloed.load(std::memory_order_relaxed);
         if (anySoloed && !soloed) continue;
 
+        /* A channel that produced silence is routed nowhere.
+         *
+         * The peak above already says whether `node->mix()` wrote anything,
+         * and a silent block adds nothing to any bus -- but it was still
+         * panned and then summed into every send it has, which on this board
+         * is two esp-dsp passes over 128 floats per send. Most channels are
+         * silent most of the time (nine exist; two or three sound), so this
+         * is most of the routing stage's work removed for free.
+         *
+         * Exact, not a threshold: zero in, zero out. A channel whose tail has
+         * decayed below the float epsilon was already inaudible. */
+        if (slot.peakL.load(std::memory_order_relaxed) == 0.0f &&
+            slot.peakR.load(std::memory_order_relaxed) == 0.0f) continue;
+
         /* Pan once, in the channel's own scratch, before it is sent anywhere:
          * every send then carries the same placement, as on a desk. After the
          * meter above, which stays pre-fader and pre-pan. */
