@@ -170,6 +170,24 @@ public:
     /// `outBuses[i]` must point to a buffer of `frames * 2` floats. Audio
     /// thread only — single writer.
     void render(float* const* outBuses, uint8_t numOut, uint32_t frames);
+
+    /* ── Where a render pass goes, per channel ────────────────────────────
+     *
+     * `TASKS` said audio_rt costs 42 % of core 1 at the launcher with no kit
+     * loaded, and RT_PROF narrowed that to 1040 us a block inside this
+     * render -- for 64 frames, three buses and nothing playing. Which part
+     * of it was not answerable without timing the pass from inside, so:
+     * every channel's node, and the four stages around them.
+     *
+     * The clock comes from the platform (one cycle-counter read on the
+     * board, nothing on a host) and the whole thing is off until asked for,
+     * so a render that is not being profiled pays one relaxed bool load. */
+    using CycFn = uint32_t (*)();
+    void setProfClock(CycFn fn) { cyc_ = fn; }
+    void profEnable(bool on);
+    /// Mean microseconds per pass, per channel and per stage. Reads, clears.
+    /// @p cpuMhz the clock the counter runs at.
+    void profRead(char* out, uint32_t cap, float cpuMhz);
     /// RT, right after render(): the channels in @p chs as they went into the
     /// mix -- panned, at their fader, silent when muted or left out by a solo
     /// -- summed into @p out, whatever they are sent to. A tap the routing
@@ -279,6 +297,12 @@ private:
     uint32_t frameCount_   = 0;
     uint32_t sampleRate_   = 0;
     uint8_t  numOutputs_   = 2;
+
+    CycFn                 cyc_ = nullptr;
+    std::atomic<bool>     prof_{false};
+    std::atomic<uint32_t> profPasses_{0};
+    std::atomic<uint64_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint64_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
 
