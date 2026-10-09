@@ -316,8 +316,14 @@ private:
     CycFn                 cyc_ = nullptr;
     std::atomic<bool>     prof_{false};
     std::atomic<uint32_t> profPasses_{0};
-    std::atomic<uint64_t> profNode_[kMixerMaxChannels] = {};
-    std::atomic<uint64_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
+    /* Sums in units of 1 << kProfShift cycles, 32-bit: render() adds to them
+     * every pass, and a 64-bit atomic is not lock-free on the S3. A whole
+     * 1.45 ms pass is ~21 800 units at 240 MHz, so a sum wraps only after
+     * ~3 minutes unread; profRead() reads and clears. */
+    static constexpr uint32_t kProfShift = 4;
+    static uint32_t profUnits(uint32_t cycles) { return (cycles + (1u << (kProfShift - 1))) >> kProfShift; }
+    std::atomic<uint32_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint32_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
 

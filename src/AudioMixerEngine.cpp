@@ -373,7 +373,8 @@ CP_COLD void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
 {
     if (!out || cap == 0) return;
     const uint32_t n = profPasses_.exchange(0, std::memory_order_relaxed);
-    const double d = (n ? double(n) : 1.0) * double(cpuMhz > 0 ? cpuMhz : 240.0);
+    const double d = (n ? double(n) : 1.0) * double(cpuMhz > 0 ? cpuMhz : 240.0) /
+                     double(1u << kProfShift);
     int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%.1f clear_us=%.1f "
                           "route_us=%.1f out_us=%.1f nodes=",
                           prof_.load(std::memory_order_relaxed) ? 1 : 0, (unsigned)n,
@@ -395,7 +396,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     if (numOut > numOutputs_) numOut = numOutputs_;
     const uint32_t stereo = frames * 2;
     const bool prof = prof_.load(std::memory_order_relaxed);
-    uint64_t peakAcc = 0;
+    uint32_t peakAcc = 0;
 
     // 1. Pull each active channel via its IAudioNode::mix() into per-channel
     //    scratch (cleared first because mix() is additive). Update per-channel
@@ -409,7 +410,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         std::memset(slot.scratch.data(), 0, stereo * sizeof(float));
         slot.node->mix(slot.scratch.data(), frames);
         const uint32_t c1 = prof ? cyc_() : 0;
-        if (prof) profNode_[ch].fetch_add(c1 - c0, std::memory_order_relaxed);
+        if (prof) profNode_[ch].fetch_add(profUnits(c1 - c0), std::memory_order_relaxed);
 
         float pL = 0.0f, pR = 0.0f;
         for (uint32_t i = 0; i < frames; ++i) {
@@ -423,7 +424,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
         if (prof) peakAcc += cyc_() - c1;
     }
-    if (prof) profPeak_.fetch_add(peakAcc, std::memory_order_relaxed);
+    if (prof) profPeak_.fetch_add(profUnits(peakAcc), std::memory_order_relaxed);
 
     // 2. Solo arbitration
     bool anySoloed = false;
@@ -438,7 +439,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         std::memset(outBuses[o], 0, stereo * sizeof(float));
     }
     const uint32_t cClear1 = prof ? cyc_() : 0;
-    if (prof) profClear_.fetch_add(cClear1 - cClear0, std::memory_order_relaxed);
+    if (prof) profClear_.fetch_add(profUnits(cClear1 - cClear0), std::memory_order_relaxed);
 
     // 4. Route + mix
     //
@@ -500,7 +501,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     }
 
     const uint32_t cRoute1 = prof ? cyc_() : 0;
-    if (prof) profRoute_.fetch_add(cRoute1 - cRoute0, std::memory_order_relaxed);
+    if (prof) profRoute_.fetch_add(profUnits(cRoute1 - cRoute0), std::memory_order_relaxed);
 
     // 5. Per-output volume + clamp + meter
     //
@@ -564,7 +565,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     }
 
     if (prof) {
-        profOut_.fetch_add(cyc_() - cRoute1, std::memory_order_relaxed);
+        profOut_.fetch_add(profUnits(cyc_() - cRoute1), std::memory_order_relaxed);
         profPasses_.fetch_add(1, std::memory_order_relaxed);
     }
 }
