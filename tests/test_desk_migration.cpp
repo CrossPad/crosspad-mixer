@@ -145,14 +145,70 @@ TEST_CASE("before the migration, by slot, the shifted channels lost their settin
 }
 
 TEST_CASE("a desk saved by the two-engine build loads onto the one-engine build", "[desk]") {
+    /* Steve's builds played the native engine on "Sampler2"; "Sampler" was
+     * the prebuilt streamer's. The one-engine image's "Sampler" *is* the
+     * native engine, so it takes Sampler2's settings, and the streamer's are
+     * dropped -- not the other way round. */
     Desk old(kTwoEngineLayout);
     dressAll(old);
-    dress(old, "Sampler2", 0.10f, 0.0f, true, false);
+    dress(old, "Sampler",  0.20f, 0.40f, true,  false);   // the streamer, unused and muted
+    dress(old, "Sampler2", 0.70f, -0.30f, false, true);   // what was heard
     const std::string saved = old.m.stateJson();
 
     Desk now(kMainLayout);   // the default image: one "Sampler", no "Sampler2"
     REQUIRE(now.m.applyStateJson(saved));
-    checkAllDressed(now);
+    checkDressed(now, "Sampler", 0.70f, -0.30f, false, true);
+    checkDressed(now, "Pitched", 0.80f,  0.20f, true,  false);
+    checkDressed(now, "USB",     0.30f,  0.00f, false, false);
+    checkDressed(now, "Click",   0.25f,  0.50f, true,  false);
+    checkDressed(now, "IN1",     0.60f, -0.70f, false, true);
+    checkDressed(now, "IN2",     0.55f,  0.70f, true,  true);
+    checkDressed(now, "IN3",     0.45f,  0.30f, false, false);
+}
+
+TEST_CASE("a two-engine desk whose heard engine was muted or unrouted still sounds on the one-engine build", "[desk]") {
+    /* A desk where Sampler2 was muted (the streamer was the one in use) or
+     * sent nowhere would leave the only sample engine of this build silent,
+     * with nothing on the Mixer saying why. On the migration it is unmuted,
+     * and given back the routes this build set it up with. */
+    Desk old(kTwoEngineLayout);
+    dressAll(old);
+    const int s2 = old.slot("Sampler2");
+    old.m.setChannelVolume(s2, 0.65f);
+    old.m.setChannelMute(s2, true);
+    for (uint8_t o = 0; o < kOuts; ++o) old.m.setRouteEnabled(s2, o, false);
+    const std::string saved = old.m.stateJson();
+
+    Desk now(kMainLayout);
+    const int s = now.slot("Sampler");
+    now.m.setRouteEnabled(s, 0, true);          // how the platform routes it at boot
+    now.m.setRouteEnabled(s, 1, true);
+    REQUIRE(now.m.applyStateJson(saved));
+    CHECK_THAT(now.m.getChannelVolume(s), WithinAbs(0.65f, kJsonEps));   // its level is kept
+    CHECK_FALSE(now.m.isChannelMuted(s));
+    CHECK(now.m.isRouteEnabled(s, 0));
+    CHECK(now.m.isRouteEnabled(s, 1));
+    CHECK_FALSE(now.m.isRouteEnabled(s, 2));
+
+    /* Not on a load that is not that migration: a muted Sampler from this
+     * same layout is the player's choice and stays muted. */
+    Desk same(kMainLayout);
+    same.m.setChannelMute(same.slot("Sampler"), true);
+    Desk again(kMainLayout);
+    REQUIRE(again.m.applyStateJson(same.m.stateJson()));
+    CHECK(again.m.isChannelMuted(again.slot("Sampler")));
+}
+
+TEST_CASE("Mic and Line from a desk of Steve's input design go back to IN1 and IN2", "[desk]") {
+    const std::vector<const char*> steve = {"Sampler", "Pitched", "Sampler2", "USB",
+                                            "Click", "Mic", "Line", "IN3"};
+    Desk old(steve);
+    dress(old, "Mic",  0.60f, -0.70f, false, true);
+    dress(old, "Line", 0.55f,  0.70f, true,  true);
+    Desk now(kMainLayout);
+    REQUIRE(now.m.applyStateJson(old.m.stateJson()));
+    checkDressed(now, "IN1", 0.60f, -0.70f, false, true);
+    checkDressed(now, "IN2", 0.55f,  0.70f, true,  true);
 }
 
 TEST_CASE("a desk from the same build round-trips", "[desk]") {

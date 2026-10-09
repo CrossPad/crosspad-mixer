@@ -29,8 +29,9 @@
  *     a desk from before it gave nothing to any of them (the name guard
  *     refused every one) -- and a build without the channel would shift them
  *     back the other way.
- *  3. A channel that was only renamed (kRenamed, old name then new): the
- *     channel with the new name, its saved slot first.
+ *  3. A channel that was only renamed (kRenamed, either way round: main's
+ *     IN1/IN2 and Steve's Mic/Line are the same jacks): the channel with the
+ *     other name, its saved slot first.
  *  4. A saved entry with no name (nothing written so far does that) or a
  *     saved slot nobody has registered yet: the saved slot, as before.
  * A slot an earlier entry of the same desk took is not given out twice. */
@@ -57,9 +58,11 @@ int AudioMixerEngine::slotForSaved(int id, const char* name, const bool* taken) 
     int ch = liveNamed(name);
     if (ch >= 0) return ch;
     for (const auto& r : kRenamed) {
-        if (std::strcmp(name, r[0]) != 0) continue;
-        ch = liveNamed(r[1]);
-        if (ch >= 0) return ch;
+        for (int from = 0; from < 2; ++from) {
+            if (std::strcmp(name, r[from]) != 0) continue;
+            ch = liveNamed(r[1 - from]);
+            if (ch >= 0) return ch;
+        }
     }
     /* Not on this desk under any name: only a slot nothing has registered
      * keeps the saved settings (a desk applied before its channels exist). */
@@ -135,8 +138,43 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
      * channel, which keeps its defaults. */
     bool taken[kMixerMaxChannels] = {};
     JsonArray channelsArr = doc["channels"];
+
+    /* A desk of a two-engine build (the prebuilt streamer on "Sampler", the
+     * native engine on "Sampler2") onto a build with only the native one,
+     * which is called "Sampler". What was heard there was Sampler2 -- Steve's
+     * builds played it -- so its settings are the ones this build's Sampler
+     * gets, and the streamer's (often muted, being unused) are dropped. By
+     * name alone it went the other way: the streamer's mute on the only
+     * engine, and Sampler2's settings nowhere. */
+    auto liveSlot = [&](const char* want) -> int {
+        for (int ch = 0; ch < kMixerMaxChannels; ++ch) {
+            if (channels_[ch].active.load(std::memory_order_acquire) &&
+                std::strcmp(channels_[ch].name, want) == 0) {
+                return ch;
+            }
+        }
+        return -1;
+    };
+    bool deskHasSampler2 = false;
     for (JsonObject c : channelsArr) {
-        const int id = slotForSaved(c["id"] | -1, c["name"] | "", taken);
+        if (std::strcmp(c["name"] | "", "Sampler2") == 0) deskHasSampler2 = true;
+    }
+    const int engineSlot = (deskHasSampler2 && liveSlot("Sampler2") < 0) ? liveSlot("Sampler") : -1;
+    /* The routes this build gave its engine at boot, for the check below. */
+    bool bootRoute[kMixerMaxOutputs] = {};
+    if (engineSlot >= 0) {
+        for (uint8_t o = 0; o < kMixerMaxOutputs; ++o) {
+            bootRoute[o] = channels_[engineSlot].routeEnabled[o].load(std::memory_order_relaxed);
+        }
+    }
+
+    for (JsonObject c : channelsArr) {
+        const char* savedName = c["name"] | "";
+        if (engineSlot >= 0) {
+            if (std::strcmp(savedName, "Sampler") == 0) continue;     // the streamer's
+            if (std::strcmp(savedName, "Sampler2") == 0) savedName = "Sampler";
+        }
+        const int id = slotForSaved(c["id"] | -1, savedName, taken);
         if (id < 0) continue;
         taken[id] = true;
         auto& slot = channels_[id];
@@ -150,6 +188,30 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
             if (o < 0 || o >= kMixerMaxOutputs) continue;
             slot.routeEnabled[o].store(r["enabled"] | false, std::memory_order_relaxed);
             slot.routeVol[o]    .store(r["volume"]  | 1.0f,  std::memory_order_relaxed);
+        }
+    }
+
+    /* The one sample engine of this build must not come out of that
+     * migration silent: a desk where Sampler2 was muted (the streamer was in
+     * use) or sent nowhere would leave the pads dead with nothing on the
+     * Mixer saying why. Unmuted, and given back the routes it booted with;
+     * its level and pan stay the desk's. Only on this migration -- a muted
+     * Sampler from a desk of this layout is the player's choice. */
+    if (engineSlot >= 0) {
+        auto& eng = channels_[engineSlot];
+        if (eng.muted.load(std::memory_order_relaxed)) {
+            eng.muted.store(false, std::memory_order_relaxed);
+            printf("[Mixer] desk migration: Sampler2 -> Sampler loaded muted, unmuted\n");
+        }
+        bool anyRoute = false;
+        for (uint8_t o = 0; o < numOutputs_; ++o) {
+            anyRoute = anyRoute || eng.routeEnabled[o].load(std::memory_order_relaxed);
+        }
+        if (!anyRoute) {
+            for (uint8_t o = 0; o < kMixerMaxOutputs; ++o) {
+                eng.routeEnabled[o].store(bootRoute[o], std::memory_order_relaxed);
+            }
+            printf("[Mixer] desk migration: Sampler2 -> Sampler had no route, boot routes restored\n");
         }
     }
 
