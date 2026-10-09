@@ -21,6 +21,15 @@
 #include <memory>
 #include <string>
 
+/* Registration, setup and the profiler's report run at boot or from a verb,
+ * never per block; a platform that builds this file for speed for render()
+ * gets them built for size. GCC's `cold` changes nothing about what they do. */
+#if defined(__GNUC__)
+#define CP_COLD __attribute__((cold))
+#else
+#define CP_COLD
+#endif
+
 AudioMixerEngine::AudioMixerEngine() {
     for (auto& slot : channels_) {
         for (uint8_t o = 0; o < kMixerMaxOutputs; ++o) {
@@ -34,7 +43,7 @@ AudioMixerEngine::~AudioMixerEngine() = default;
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
+CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
     for (auto& eq : outputEq_) eq.setRate(sampleRate);
 
     frameCount_ = frameCount;
@@ -68,7 +77,7 @@ void AudioMixerEngine::resetChannelSlot(ChannelSlot& s) {
     s.peakR .store(0.0f, std::memory_order_relaxed);
 }
 
-void AudioMixerEngine::setDefaults() {
+CP_COLD void AudioMixerEngine::setDefaults() {
     std::lock_guard<std::mutex> lock(registrationMutex_);
     for (auto& slot : channels_) {
         resetChannelSlot(slot);
@@ -86,7 +95,7 @@ void AudioMixerEngine::setDefaults() {
 
 // ── Channel registration ───────────────────────────────────────────────────
 
-AudioMixerEngine::ChannelId
+CP_COLD AudioMixerEngine::ChannelId
 AudioMixerEngine::addChannel(crosspad::IAudioNode* node, const char* name) {
     if (!node) return kMixerInvalidChannelId;
     std::lock_guard<std::mutex> lock(registrationMutex_);
@@ -128,7 +137,7 @@ AudioMixerEngine::addChannel(crosspad::IAudioNode* node, const char* name) {
     return kMixerInvalidChannelId;
 }
 
-void AudioMixerEngine::removeChannel(ChannelId ch) {
+CP_COLD void AudioMixerEngine::removeChannel(ChannelId ch) {
     if (ch >= kMixerMaxChannels) return;
     std::lock_guard<std::mutex> lock(registrationMutex_);
     auto& slot = channels_[ch];
@@ -160,7 +169,7 @@ void AudioMixerEngine::setOutputHeard(OutputId out, bool heard) {
     if (out < kMixerMaxOutputs) outputs_[out].heard.store(heard, std::memory_order_relaxed);
 }
 
-void AudioMixerEngine::setOutputEq(OutputId out, const crosspad::EqSettings& eq) {
+CP_COLD void AudioMixerEngine::setOutputEq(OutputId out, const crosspad::EqSettings& eq) {
     if (out >= kMixerEqOutputs) return;
     outputEq_[out].set(eq);
     /* No notify: in this engine a setter changes the desk and whoever was
@@ -349,7 +358,7 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
     }
 }
 
-void AudioMixerEngine::profEnable(bool on)
+CP_COLD void AudioMixerEngine::profEnable(bool on)
 {
     profPasses_.store(0, std::memory_order_relaxed);
     for (auto& n : profNode_) n.store(0, std::memory_order_relaxed);
@@ -360,7 +369,7 @@ void AudioMixerEngine::profEnable(bool on)
     prof_.store(on && cyc_ != nullptr, std::memory_order_relaxed);
 }
 
-void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
+CP_COLD void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
 {
     if (!out || cap == 0) return;
     const uint32_t n = profPasses_.exchange(0, std::memory_order_relaxed);
