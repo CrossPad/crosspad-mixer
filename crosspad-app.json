@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.8.1",
+  "version": "0.10.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,15 +15,19 @@
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.10.0: 0.8.1 (master: input pairs, silent channels skipped, NaN kept off the buses) and 0.9.1 (the engine branch: Source switch, IN as USB/Line/Mic, EQ across the outputs, per-channel render timing) merged; the look-up table files both the IN1/IN2/IN3 and the Line/Mic channel names",
     "0.8.1 (0.7.2 merged in): render() neither pans nor sends a channel whose block is silent (peak 0) -- the buses come out bit for bit the same, and every quiet channel saves two passes per send; a block of only NaN and zeros no longer reaches the buses (renderTap() still sums it); host tests in tests/, the scalar and the esp-dsp path",
     "0.8.0: the input pair on IN (IInputPairs, core 1.44.0): Mic + 1/2, Mic + 3/4, 1/2 + 3/4 where the board has three inputs on two ADCs; Line 1/2 and Line 3/4 as their own rows on IN and ROUTE, the input left out dimmed with its gain and sends kept",
     "0.7.1: saveState()/loadState() through stdio instead of fstream (smaller firmware image); same file, same .tmp/.bak commit and fallback",
+    "0.9.1: saveState()/loadState() through stdio instead of fstream (smaller firmware image); same file, same .tmp/.bak commit and fallback",
+    "0.9.0: IN reads USB in, In 1/2, In 3/4, Mic. The two line sockets share one converter, so they are two rows over one channel: the one the converter is on is live, the other is dimmed, and tapping it makes it live. Also fixes the page they were filed under -- the look-up table still said IN1/IN2 after the platform renamed the channels Mic and Line, which quietly put both on SOURCES.",
+    "0.8.0: a Source switch in the channel window for an input whose board gives it a choice -- on CrossPad the two line-in jacks share one converter, so Line picks In 1/2 or In 3/4. Needs core 1.43 (IInputGain::sources/setSource).",
     "0.7.0: AudioMixerEngine::renderTap() -- chosen channels as the mix has them (fader, pan, mute, solo) summed after render, whatever they are sent to: the platform records a bounce from the pads alone, not from a bus the inputs can reach",
     "0.6.0: PRESETS (the list tab) -- the whole desk (levels, mutes, pan, sends, outputs, input gain) saved under a name on the card, loaded back, UNDO for the last load; STREAM, BEATS and SAMPLING start as a starting point for their name; MixerPresets, the platform names the folder",
     "0.5.0 (0.4.1 merged in: builds on the PC against LVGL 9.4): MONITOR on every input (MON on its row, a Monitor row in its window): off, 1/2, 3/4 or both -- the outputs the engine marks heard; outputs named 1/2 (speakers) and 3/4 (phones); AudioMixerEngine::setOutputHeard/isOutputHeard",
     "0.4.0: IN / SOURCES / OUT / ROUTE tabs along the bottom, a row per channel with a long fader, the channel window (input gain, pan, sends); requires core 1.25 (IInputGain) and gui 1.14",
     "0.2.1: Merge lvgl.h include fix + PlatformIO library.json with MixerPadLogic registration",
-    "0.2.0: Dynamic IAudioNode-based channels (up to 16 × 8 outputs); ESP-IDF build target",
-    "0.1.0: Initial release — VU meters, 3x2 routing matrix, volume + mute/solo"
+    "0.2.0: Dynamic IAudioNode-based channels (up to 16 \u00d7 8 outputs); ESP-IDF build target",
+    "0.1.0: Initial release \u2014 VU meters, 3x2 routing matrix, volume + mute/solo"
   ]
 }

@@ -26,12 +26,16 @@
 #include <string>
 #include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
+#include <crosspad/audio/OutputEq.hpp>
 
 namespace crosspad { class IAudioNode; }
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 static constexpr uint8_t kMixerMaxChannels = 16;
 static constexpr uint8_t kMixerMaxOutputs  = 8;
+/// Outputs that can carry an EQ: the first two, which on every board so far
+/// are the speakers and the headphones.
+static constexpr uint8_t kMixerEqOutputs   = 2;
 static constexpr uint8_t kMixerInvalidChannelId = 0xFF;
 static constexpr uint8_t kMixerNameLen = 24;
 
@@ -105,6 +109,23 @@ public:
     void setOutputHeard(OutputId out, bool heard);
     bool isOutputHeard(OutputId out) const;
 
+    // ── Output EQ ──────────────────────────────────────────────────────────
+    //
+    // Four bands across an output, for evening out what it plays through: a
+    // speaker this size has a response, and so does a headphone amp, and the
+    // two are not each other's. It sits where a console's monitor EQ sits --
+    // after the mix, before that output's own fader -- so a band that lifts
+    // something leaves the fader to take it back, and nothing downstream of
+    // the correction can undo it.
+    //
+    // Saved with the desk (stateJson), so a board keeps its correction.
+
+    /// Not from the render thread: the coefficients are worked out here.
+    void setOutputEq(OutputId out, const crosspad::EqSettings& eq);
+    crosspad::EqSettings getOutputEq(OutputId out) const;
+    /// Whether that output's EQ is doing anything at all.
+    bool isOutputEqActive(OutputId out) const;
+
     // ── Routing matrix ─────────────────────────────────────────────────────
 
     void  setRouteEnabled(ChannelId ch, OutputId out, bool enabled);
@@ -149,6 +170,24 @@ public:
     /// `outBuses[i]` must point to a buffer of `frames * 2` floats. Audio
     /// thread only — single writer.
     void render(float* const* outBuses, uint8_t numOut, uint32_t frames);
+
+    /* ── Where a render pass goes, per channel ────────────────────────────
+     *
+     * `TASKS` said audio_rt costs 42 % of core 1 at the launcher with no kit
+     * loaded, and RT_PROF narrowed that to 1040 us a block inside this
+     * render -- for 64 frames, three buses and nothing playing. Which part
+     * of it was not answerable without timing the pass from inside, so:
+     * every channel's node, and the four stages around them.
+     *
+     * The clock comes from the platform (one cycle-counter read on the
+     * board, nothing on a host) and the whole thing is off until asked for,
+     * so a render that is not being profiled pays one relaxed bool load. */
+    using CycFn = uint32_t (*)();
+    void setProfClock(CycFn fn) { cyc_ = fn; }
+    void profEnable(bool on);
+    /// Mean microseconds per pass, per channel and per stage. Reads, clears.
+    /// @p cpuMhz the clock the counter runs at.
+    void profRead(char* out, uint32_t cap, float cpuMhz);
     /// RT, right after render(): the channels in @p chs as they went into the
     /// mix -- panned, at their fader, silent when muted or left out by a solo
     /// -- summed into @p out, whatever they are sent to. A tap the routing
@@ -246,6 +285,11 @@ private:
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
+    /* One per output that can be EQ'd -- the ones a board plays through, not
+     * all eight slots. Internal RAM on this hardware is counted in hundreds
+     * of bytes at boot (see EqChain), and an EQ across a recording bus is
+     * not a thing anybody asked for. */
+    crosspad::EqChain outputEq_[kMixerEqOutputs];
 
     std::atomic<crosspad::AudioRingBuffer<int16_t>*> tapBuffer_{nullptr};
     std::atomic<uint8_t> tapOutput_{0};
@@ -253,6 +297,12 @@ private:
     uint32_t frameCount_   = 0;
     uint32_t sampleRate_   = 0;
     uint8_t  numOutputs_   = 2;
+
+    CycFn                 cyc_ = nullptr;
+    std::atomic<bool>     prof_{false};
+    std::atomic<uint32_t> profPasses_{0};
+    std::atomic<uint64_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint64_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
 

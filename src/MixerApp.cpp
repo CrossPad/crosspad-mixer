@@ -95,10 +95,18 @@ const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", LV_SYMB
 /// How a channel is named, coloured and filed, by the name it registers under.
 struct Look { const char* name; const char* label; uint32_t color; Page page; };
 const Look kLooks[] = {
+    /* IN, in the order a player reads it: what the computer sends, then the
+     * two line sockets, then the mics. The channels are named Mic and Line
+     * by the platform -- they used to be IN1 and IN2, and this table was not
+     * renamed with them, which quietly filed both onto SOURCES. */
+    {"USB",     "USB in",  0xFFC857, kIn},
+    {"Line",    "Line in", 0xFF9552, kIn},
+    {"Mic",     "Mic",     0xB48CFF, kIn},
+    /* The names master's platform gives its inputs (input pairs, 0.8.0),
+     * kept beside the ones above: whichever the platform registers is filed. */
     {"IN1",     "Mic",      0xB48CFF, kIn},
     {"IN2",     "Line 1/2", 0xFF9552, kIn},
     {"IN3",     "Line 3/4", 0xFFCF99, kIn},
-    {"USB",     "USB in",  0xFFC857, kIn},
     {"Sampler", "Sampler", 0xC6FF47, kSources},
     {"Pitched", "Pitched", 0x5AC8FF, kSources},
     {"Click",   "Click",   0xFF7A9A, kSources},
@@ -126,6 +134,11 @@ const char* output_role(const char* name)
 struct Row {
     bool      output = false;
     uint8_t   id = 0;            // channel id, or output id
+    /* Which socket this row is, for a channel that has more than one: the
+     * board wires both line-in jacks to one converter, so "Line in 1/2" and
+     * "Line in 3/4" are two rows over one channel and only the one that is
+     * selected is live. -1 for every other row. */
+    int8_t    src = -1;
     Page      page = kSources;
     lv_obj_t* box = nullptr;
     lv_obj_t* name = nullptr;    // the button that opens the channel
@@ -169,6 +182,18 @@ constexpr int kMaxMonChoices = kMixerMaxOutputs + 2;   // off, each heard output
 lv_obj_t* s_dMon[kMaxMonChoices] = {};
 uint32_t  s_dMonMask[kMaxMonChoices] = {};
 int       s_gainInput = -1;          // IInputGain index of the channel in the window
+constexpr int kMaxSrcChoices = 4;    // sockets sharing one converter; CrossPad has 2
+/* In PSRAM: this board reserves its 64 kB DMA pool after the static data is
+ * placed and boots with under 150 bytes of internal RAM to spare, so a new
+ * array of pointers here is enough to abort main_task. Touched only from the
+ * LVGL thread, never with the cache off. */
+#ifdef ESP_PLATFORM
+  #include "esp_attr.h"
+  EXT_RAM_BSS_ATTR lv_obj_t* s_dSrc[kMaxSrcChoices];
+#else
+  lv_obj_t* s_dSrc[kMaxSrcChoices] = {};
+#endif
+
 
 #ifdef MIXER_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
@@ -423,12 +448,49 @@ void rebuild_group();
 void add_presets_to_group();
 void refresh_presets();
 
+/* An output's window is its tone: three bands across what that output plays
+ * through, which is what evening out a speaker or a pair of headphones takes.
+ * The shapes are fixed and the sliders are their gain -- a correction is a
+ * few dB in the right place, not a design exercise -- and the fourth band,
+ * and any shape at all, is there over CDC (MIX_EQ) for the fine work. */
+constexpr int kToneBands = 3;
+const struct ToneBand {
+    const char*      label;
+    crosspad::EqKind kind;
+    float            hz;
+    float            q;
+} kTone[kToneBands] = {
+    {"Low",  crosspad::EqKind::LowShelf,   160.0f, 0.70f},
+    {"Mid",  crosspad::EqKind::Peak,      1200.0f, 1.00f},
+    {"High", crosspad::EqKind::HighShelf, 5000.0f, 0.70f},
+};
+
+lv_obj_t* s_dEq[kToneBands] = {};
+lv_obj_t* s_dEqLabel[kToneBands] = {};
+
 void detail_labels()
 {
     if (s_detailRow < 0 || !s_detail) return;
     const Row& r = s_rows[s_detailRow];
     auto& m = getMixerEngine();
     char buf[48];
+    if (r.output) {
+        /* "Low   +3 dB", and the shape under the name of the band. */
+        const crosspad::EqSettings eq = m.getOutputEq(r.id);
+        for (int b = 0; b < kToneBands; ++b) {
+            if (!s_dEqLabel[b]) continue;
+            const int db = (int)lroundf(eq.band[b].gainDb);
+            const float hz = kTone[b].hz;
+            if (hz >= 1000.0f) {
+                std::snprintf(buf, sizeof(buf), "%-5s %+3d dB   %.1f kHz", kTone[b].label, db,
+                              (double)(hz / 1000.0f));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%-5s %+3d dB   %d Hz", kTone[b].label, db, (int)hz);
+            }
+            set_text(s_dEqLabel[b], buf);
+        }
+        return;
+    }
     if (s_dGainLabel && gains() && s_gainInput >= 0) {
         const float db = gains()->gainDb(s_gainInput);
         std::snprintf(buf, sizeof(buf), "Gain  +%.0f dB", (double)db);
@@ -480,6 +542,38 @@ void dsend_cb(lv_event_t* e)
     detail_labels();
 }
 
+
+void eq_band_cb(lv_event_t* e)
+{
+    const int b = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_detailRow < 0 || b < 0 || b >= kToneBands || !s_dEq[b]) return;
+    auto& m = getMixerEngine();
+    const uint8_t out = s_rows[s_detailRow].id;
+    crosspad::EqSettings eq = m.getOutputEq(out);
+    crosspad::EqBand& band = eq.band[b];
+    band.kind   = kTone[b].kind;
+    band.hz     = kTone[b].hz;
+    band.q      = kTone[b].q;
+    band.gainDb = (float)lv_slider_get_value(s_dEq[b]);
+    eq.on = true;
+    m.setOutputEq(out, eq);
+    detail_labels();
+}
+
+void eq_flat_cb(lv_event_t*)
+{
+    if (s_detailRow < 0) return;
+    auto& m = getMixerEngine();
+    const uint8_t out = s_rows[s_detailRow].id;
+    crosspad::EqSettings eq = m.getOutputEq(out);
+    for (int b = 0; b < kToneBands; ++b) {
+        eq.band[b].gainDb = 0.0f;
+        if (s_dEq[b]) lv_slider_set_value(s_dEq[b], 0, LV_ANIM_OFF);
+    }
+    m.setOutputEq(out, eq);
+    detail_labels();
+}
+
 void close_detail()
 {
     if (!s_detail) return;
@@ -490,11 +584,14 @@ void close_detail()
 #endif
     lv_obj_delete_async(s_detail);
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
+    for (auto& o : s_dEq) o = nullptr;
+    for (auto& o : s_dEqLabel) o = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
     for (auto& s : s_dMon) s = nullptr;
     s_detailRow = -1;
     s_gainInput = -1;
+    for (auto& b : s_dSrc) b = nullptr;
 }
 
 lv_obj_t* detail_line(const char* text, lv_obj_t** label)
@@ -520,7 +617,10 @@ lv_obj_t* detail_slider(int32_t min, int32_t max, int32_t v, lv_color_t fill, lv
 
 void open_detail(int idx)
 {
-    if (s_detail || idx < 0 || idx >= s_rowCount || s_rows[idx].output) return;
+    if (s_detail || idx < 0 || idx >= s_rowCount) return;
+    /* An output opens too, for its tone -- but only one that can carry an
+     * EQ (the ones a board plays through). */
+    if (s_rows[idx].output && s_rows[idx].id >= kMixerEqOutputs) return;
     const Row& r = s_rows[idx];
     auto& m = getMixerEngine();
     const Look* look = look_for(m.getChannelName(r.id));
@@ -546,8 +646,76 @@ void open_detail(int idx)
 
     lv_obj_t* title = lv_label_create(s_detail);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, color, 0);
-    lv_label_set_text(title, look ? look->label : m.getChannelName(r.id));
+    lv_obj_set_style_text_color(title, r.output ? kAccent : color, 0);
+    lv_label_set_text(title, r.output ? m.getOutputName(r.id)
+                                      : (look ? look->label : m.getChannelName(r.id)));
+
+    if (r.output) {
+        lv_obj_t* hint = lv_label_create(s_detail);
+        lv_obj_set_width(hint, LV_PCT(94));
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(hint, kDim, 0);
+        lv_label_set_text_fmt(hint, "tone of the %s   .   160 Hz shelf, 1.2 kHz, 5 kHz shelf",
+                              output_role(m.getOutputName(r.id)));
+        const crosspad::EqSettings eq = m.getOutputEq(r.id);
+        for (int b = 0; b < kToneBands; ++b) {
+            detail_line("", &s_dEqLabel[b]);
+            s_dEq[b] = detail_slider(-12, 12, (int32_t)lroundf(eq.band[b].gainDb),
+                                     kAccent, eq_band_cb, (void*)(intptr_t)b);
+            lv_slider_set_mode(s_dEq[b], LV_SLIDER_MODE_SYMMETRICAL);
+        }
+        lv_obj_t* flat = make_button(s_detail, 96, 26, "FLAT", eq_flat_cb, nullptr,
+                                     &lv_font_montserrat_10);
+        lv_obj_t* done = make_button(s_detail, 120, 28, LV_SYMBOL_OK " Done",
+                                     [](lv_event_t*) { close_detail(); }, nullptr);
+        lv_obj_set_style_bg_color(done, kAccent, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(done, 0), kInk, 0);
+#ifdef MIXER_USE_ENCODER
+        if (s_detailGroup) {
+            lv_group_add_obj(s_detailGroup, flat);
+            lv_group_add_obj(s_detailGroup, done);
+            lv_group_focus_obj(s_dEq[0]);
+        }
+#endif
+        detail_labels();
+        return;
+    }
+
+    if (s_gainInput >= 0 && gains()->sources(s_gainInput) >= 2) {
+        /* Two sockets, one converter: the board can only listen to one of
+         * them, so this is a switch rather than a second channel. Changing it
+         * is heard at once -- the routing re-applies the claim. */
+        auto* g = gains();
+        detail_line("Source", nullptr);
+        lv_obj_t* seg = make_box(s_detail);
+        lv_obj_set_size(seg, LV_PCT(94), 28);
+        lv_obj_set_flex_flow(seg, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(seg, 4, 0);
+        const int cur = g->source(s_gainInput);
+        for (int i = 0; i < g->sources(s_gainInput) && i < kMaxSrcChoices; ++i) {
+            lv_obj_t* b = make_button(seg, 10, 28, g->sourceName(s_gainInput, i), [](lv_event_t* e) {
+                const int k = (int)(intptr_t)lv_event_get_user_data(e);
+                if (s_gainInput < 0 || !gains()) return;
+                gains()->setSource(s_gainInput, k);
+                for (int j = 0; j < kMaxSrcChoices; ++j) {
+                    if (!s_dSrc[j]) continue;
+                    const bool on = j == gains()->source(s_gainInput);
+                    lv_obj_set_style_bg_color(s_dSrc[j], on ? kAccent : kRowBg, 0);
+                    lv_obj_set_style_text_color(lv_obj_get_child(s_dSrc[j], 0), on ? kInk : kText, 0);
+                }
+            }, (void*)(intptr_t)i);
+            lv_obj_set_flex_grow(b, 1);
+            if (i == cur) {
+                lv_obj_set_style_bg_color(b, kAccent, 0);
+                lv_obj_set_style_text_color(lv_obj_get_child(b, 0), kInk, 0);
+            }
+#ifdef MIXER_USE_ENCODER
+            if (s_detailGroup) lv_group_add_obj(s_detailGroup, b);
+#endif
+            s_dSrc[i] = b;
+        }
+    }
 
     if (s_gainInput >= 0) {
         auto* g = gains();
@@ -607,7 +775,27 @@ void open_detail(int idx)
     detail_labels();
 }
 
-void name_cb(lv_event_t* e) { open_detail((int)(intptr_t)lv_event_get_user_data(e)); }
+/// Which socket a row's channel is listening to, or -1 where there is no choice.
+int live_src_of(uint8_t ch)
+{
+    const int gi = gain_input_of(ch);
+    if (gi < 0 || !gains() || gains()->sources(gi) < 2) return -1;
+    return gains()->source(gi);
+}
+
+void name_cb(lv_event_t* e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rowCount) return;
+    const Row& r = s_rows[idx];
+    /* One converter, two sockets: a tap on the one that is not live makes it
+     * live rather than opening a channel the row does not really own yet. */
+    if (r.src >= 0 && live_src_of(r.id) != r.src) {
+        if (gains()) gains()->setSource(gain_input_of(r.id), r.src);
+        return;
+    }
+    open_detail(idx);
+}
 
 // ── pages ──────────────────────────────────────────────────────────────────
 
@@ -639,7 +827,9 @@ void rebuild_group()
         for (int i = 0; i < s_rowCount; ++i) {
             const Row& r = s_rows[i];
             if (r.page != s_page) continue;
-            if (!r.output) add_to_group(r.name);          // outputs have no window
+            /* An output's name opens its tone, so it belongs in the walk --
+             * but only an output that can carry an EQ. */
+            if (!r.output || r.id < kMixerEqOutputs) add_to_group(r.name);
             if (!lv_obj_has_state(r.fader, LV_STATE_DISABLED)) add_to_group(r.fader);
             add_to_group(r.mute);
             add_to_group(r.solo);
@@ -877,6 +1067,12 @@ void tick_row(Row& r, bool anySolo)
         m.getOutputLevel(r.id, l, rr);        // already post-master
         gain = m.getOutputVolume(r.id);
         muted = m.isOutputMuted(r.id);
+    } else if (r.src >= 0 && live_src_of(r.id) != r.src) {
+        /* Not the socket the converter is on: no signal can reach this row,
+         * so it shows none rather than mirroring its twin. */
+        l = rr = 0.0f;
+        gain = m.getChannelVolume(r.id);
+        muted = true;
     } else {
         m.getChannelLevel(r.id, l, rr);       // pre-fader: fader it here
         gain = m.getChannelVolume(r.id);
@@ -965,7 +1161,7 @@ void tick_cb(lv_timer_t*)
 
 // ── building ───────────────────────────────────────────────────────────────
 
-void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
+void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int8_t src = -1)
 {
     auto& m = getMixerEngine();
     Row& r = s_rows[idx];
@@ -973,9 +1169,11 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     r.output = output;
     r.id = id;
     r.page = where;
+    r.src = src;
 
     const Look* look = output ? nullptr : look_for(m.getChannelName(id));
     const char* label = output ? m.getOutputName(id) : (look ? look->label : m.getChannelName(id));
+    if (src >= 0) label = gains() ? gains()->sourceName(gain_input_of(id), src) : "Line";
     const lv_color_t color = output ? kText : (look ? lv_color_hex(look->color) : kText);
 
     r.box = make_box(page);
@@ -1001,7 +1199,11 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where)
     lv_obj_set_style_outline_width(r.name, 2, LV_STATE_FOCUS_KEY);
     lv_obj_set_flex_flow(r.name, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(r.name, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    if (!output) lv_obj_add_event_cb(r.name, name_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    /* An output opens its tone; a channel opens the rest of itself. The
+     * outputs that carry no EQ (a recording bus) open nothing. */
+    if (!output || id < kMixerEqOutputs) {
+        lv_obj_add_event_cb(r.name, name_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    }
     lv_obj_t* nl = lv_label_create(r.name);
     lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(nl, color, 0);
@@ -1207,7 +1409,19 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     auto place = [&](uint8_t ch) {
         const Look* look = look_for(m.getChannelName(ch));
         const Page where = look ? look->page : kSources;
-        build_row(s_pages[where], s_rowCount++, false, ch, where);
+        /* A channel whose input offers a choice of socket gets one row per
+         * socket: the board shows both line-in jacks even though only the
+         * selected one is live, because "where do I plug in" is the question
+         * a mixer should answer without opening anything. */
+        const int gi = gain_input_of(ch);
+        const int sockets = (gi >= 0 && gains()) ? gains()->sources(gi) : 0;
+        if (sockets >= 2) {
+            for (int k = 0; k < sockets && s_rowCount < kMaxRows; ++k) {
+                build_row(s_pages[where], s_rowCount++, false, ch, where, (int8_t)k);
+            }
+        } else {
+            build_row(s_pages[where], s_rowCount++, false, ch, where);
+        }
         s_sources[s_sourceCount++] = ch;
     };
     for (const Look& l : kLooks) {
@@ -1282,6 +1496,8 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& r : s_pre) r = PresetRow{};
     s_preStatus = s_preUndo = nullptr;
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
+    for (auto& o : s_dEq) o = nullptr;
+    for (auto& o : s_dEqLabel) o = nullptr;
     for (auto& s : s_dSends) s = nullptr;
     for (auto& s : s_dSendLabels) s = nullptr;
     for (auto& s : s_dMon) s = nullptr;

@@ -37,6 +37,8 @@ AudioMixerEngine::~AudioMixerEngine() = default;
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
+    for (auto& eq : outputEq_) eq.setRate(sampleRate);
+
     frameCount_ = frameCount;
     sampleRate_ = sampleRate;
     if (numOutputs == 0) numOutputs = 1;
@@ -158,6 +160,25 @@ const char* AudioMixerEngine::getOutputName(OutputId out) const {
 
 void AudioMixerEngine::setOutputHeard(OutputId out, bool heard) {
     if (out < kMixerMaxOutputs) outputs_[out].heard.store(heard, std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::setOutputEq(OutputId out, const crosspad::EqSettings& eq) {
+    if (out >= kMixerEqOutputs) return;
+    outputEq_[out].set(eq);
+    /* No notify: in this engine a setter changes the desk and whoever was
+     * turning the knobs says when it is worth saving (MixerApp on its close,
+     * the presets, a host command). Serialising it here meant a CDC verb
+     * doing it on the main task's four kilobytes of stack, inside
+     * ArduinoJson's allocator -- which is exactly where it ended. */
+}
+
+crosspad::EqSettings AudioMixerEngine::getOutputEq(OutputId out) const {
+    if (out >= kMixerEqOutputs) return {};
+    return outputEq_[out].settings();
+}
+
+bool AudioMixerEngine::isOutputEqActive(OutputId out) const {
+    return out < kMixerEqOutputs && outputEq_[out].on();
 }
 
 bool AudioMixerEngine::isOutputHeard(OutputId out) const {
@@ -330,9 +351,44 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
     }
 }
 
+void AudioMixerEngine::profEnable(bool on)
+{
+    profPasses_.store(0, std::memory_order_relaxed);
+    for (auto& n : profNode_) n.store(0, std::memory_order_relaxed);
+    profPeak_.store(0, std::memory_order_relaxed);
+    profClear_.store(0, std::memory_order_relaxed);
+    profRoute_.store(0, std::memory_order_relaxed);
+    profOut_.store(0, std::memory_order_relaxed);
+    prof_.store(on && cyc_ != nullptr, std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
+{
+    if (!out || cap == 0) return;
+    const uint32_t n = profPasses_.exchange(0, std::memory_order_relaxed);
+    const double d = (n ? double(n) : 1.0) * double(cpuMhz > 0 ? cpuMhz : 240.0);
+    int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%.1f clear_us=%.1f "
+                          "route_us=%.1f out_us=%.1f nodes=",
+                          prof_.load(std::memory_order_relaxed) ? 1 : 0, (unsigned)n,
+                          double(profPeak_.exchange(0, std::memory_order_relaxed)) / d,
+                          double(profClear_.exchange(0, std::memory_order_relaxed)) / d,
+                          double(profRoute_.exchange(0, std::memory_order_relaxed)) / d,
+                          double(profOut_.exchange(0, std::memory_order_relaxed)) / d);
+    /* Only the channels that cost something: sixteen "ch3=0.0" would push the
+     * interesting ones off a 192-byte reply. */
+    for (uint8_t ch = 0; ch < kMixerMaxChannels && w > 0 && (uint32_t)w + 16 < cap; ++ch) {
+        const double us = double(profNode_[ch].exchange(0, std::memory_order_relaxed)) / d;
+        if (us < 1.0) continue;
+        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%.0f ", (unsigned)ch, us);
+    }
+    if (w > 0 && (uint32_t)w + 3 < cap) std::snprintf(out + w, cap - (uint32_t)w, "\r\n");
+}
+
 void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t frames) {
     if (numOut > numOutputs_) numOut = numOutputs_;
     const uint32_t stereo = frames * 2;
+    const bool prof = prof_.load(std::memory_order_relaxed);
+    uint64_t peakAcc = 0;
 
     // 1. Pull each active channel via its IAudioNode::mix() into per-channel
     //    scratch (cleared first because mix() is additive). Update per-channel
@@ -342,8 +398,11 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         auto& slot = channels_[ch];
         if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
 
+        const uint32_t c0 = prof ? cyc_() : 0;
         std::memset(slot.scratch.data(), 0, stereo * sizeof(float));
         slot.node->mix(slot.scratch.data(), frames);
+        const uint32_t c1 = prof ? cyc_() : 0;
+        if (prof) profNode_[ch].fetch_add(c1 - c0, std::memory_order_relaxed);
 
         float pL = 0.0f, pR = 0.0f;
         for (uint32_t i = 0; i < frames; ++i) {
@@ -355,7 +414,9 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
         if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
+        if (prof) peakAcc += cyc_() - c1;
     }
+    if (prof) profPeak_.fetch_add(peakAcc, std::memory_order_relaxed);
 
     // 2. Solo arbitration
     bool anySoloed = false;
@@ -365,9 +426,12 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     }
 
     // 3. Clear all output buses
+    const uint32_t cClear0 = prof ? cyc_() : 0;
     for (uint8_t o = 0; o < numOut; ++o) {
         std::memset(outBuses[o], 0, stereo * sizeof(float));
     }
+    const uint32_t cClear1 = prof ? cyc_() : 0;
+    if (prof) profClear_.fetch_add(cClear1 - cClear0, std::memory_order_relaxed);
 
     // 4. Route + mix
     //
@@ -380,6 +444,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     // For sub-1-KiB stereo buffers (typical: 64..256 frames = 256..1024 B)
     // both passes stay in L1, so the win comes from the hand-tuned LX7
     // FPU loops vs the C compiler's auto-vectoriser.
+    const uint32_t cRoute0 = prof ? cyc_() : 0;
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
         if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
@@ -427,6 +492,9 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         }
     }
 
+    const uint32_t cRoute1 = prof ? cyc_() : 0;
+    if (prof) profRoute_.fetch_add(cRoute1 - cRoute0, std::memory_order_relaxed);
+
     // 5. Per-output volume + clamp + meter
     //
     // dsps_mulc_f32 runs in-place to apply the master output gain, then a
@@ -439,7 +507,12 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
 
         if (oMuted) {
             std::memset(dst, 0, stereo * sizeof(float));
+            /* The sections forget where they were: coming back from mute
+             * should not play out what was in them a minute ago. */
+            if (o < kMixerEqOutputs) outputEq_[o].reset();
         } else {
+            /* The correction, then the fader. */
+            if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
 #if CROSSPAD_MIXER_USE_ESP_DSP
             dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
 #else
@@ -481,6 +554,11 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             }
             tap->write(tapBuf_.data(), stereo);
         }
+    }
+
+    if (prof) {
+        profOut_.fetch_add(cyc_() - cRoute1, std::memory_order_relaxed);
+        profPasses_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -528,6 +606,21 @@ std::string AudioMixerEngine::stateJson() const {
         JsonObject ob = outArr.add<JsonObject>();
         ob["volume"] = outputs_[o].volume.load(std::memory_order_relaxed);
         ob["muted"]  = outputs_[o].muted .load(std::memory_order_relaxed);
+        const crosspad::EqSettings eq = o < kMixerEqOutputs ? outputEq_[o].settings()
+                                                             : crosspad::EqSettings{};
+        /* Only when there is something to say: a desk that has never had an
+         * EQ set keeps the blob the size it was. */
+        if (eq.on || eq.any()) {
+            ob["eqOn"] = eq.on;
+            JsonArray bands = ob["eq"].to<JsonArray>();
+            for (const auto& b : eq.band) {
+                JsonObject bo = bands.add<JsonObject>();
+                bo["kind"] = (int)b.kind;
+                bo["hz"]   = b.hz;
+                bo["db"]   = b.gainDb;
+                bo["q"]    = b.q;
+            }
+        }
     }
 
     std::string out;
@@ -547,9 +640,27 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         if (id < 0 || id >= kMixerMaxChannels) continue;
         auto& slot = channels_[id];
         /* By slot and by name: a build that registers its channels in another
-         * order must not hand one channel's settings to a different one. */
+         * order must not hand one channel's settings to a different one.
+         *
+         * A channel that was only *renamed* keeps its settings, through the
+         * table below: the slot is the same, so the guard would otherwise
+         * throw away a desk saved before the rename. Entries go in pairs,
+         * old name then new. */
+        static const char* const kRenamed[][2] = {
+            {"IN1", "Mic"},     // the built-in mics
+            {"IN2", "Line"},    // the line-in jacks
+        };
         const char* name = c["name"] | "";
-        if (slot.name[0] && name[0] && std::strcmp(slot.name, name) != 0) continue;
+        if (slot.name[0] && name[0] && std::strcmp(slot.name, name) != 0) {
+            bool renamed = false;
+            for (const auto& r : kRenamed) {
+                if (std::strcmp(name, r[0]) == 0 && std::strcmp(slot.name, r[1]) == 0) {
+                    renamed = true;
+                    break;
+                }
+            }
+            if (!renamed) continue;
+        }
         slot.volume.store(c["volume"] | 1.0f, std::memory_order_relaxed);
         slot.muted .store(c["muted"]  | false, std::memory_order_relaxed);
         slot.soloed.store(c["soloed"] | false, std::memory_order_relaxed);
@@ -569,6 +680,27 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         if (idx >= kMixerMaxOutputs) break;
         outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
         outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
+        /* Only a desk that has an EQ in it asks for one: an EQ's state is
+         * taken on first use, and a board that has never set one should not
+         * pay for it at boot. */
+        if (!ob["eq"].is<JsonArrayConst>() && !(ob["eqOn"] | false)) { ++idx; continue; }
+        crosspad::EqSettings eq;
+        eq.on = ob["eqOn"] | false;
+        int bi = 0;
+        /* Named, not iterated off the subscript: the range expression would
+         * be a temporary and the view into it a dangling reference. */
+        JsonArrayConst bands = ob["eq"];
+        for (JsonObjectConst bo : bands) {
+            if (bi >= crosspad::kEqBands) break;
+            crosspad::EqBand& b = eq.band[bi++];
+            const int kind = bo["kind"] | 0;
+            b.kind   = kind >= 0 && kind <= (int)crosspad::EqKind::LowPass
+                           ? (crosspad::EqKind)kind : crosspad::EqKind::Off;
+            b.hz     = bo["hz"] | 1000.0f;
+            b.gainDb = bo["db"] | 0.0f;
+            b.q      = bo["q"]  | 0.7f;
+        }
+        if (idx < kMixerEqOutputs) outputEq_[idx].set(eq);
         ++idx;
     }
     return true;
