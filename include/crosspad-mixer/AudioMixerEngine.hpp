@@ -218,7 +218,15 @@ public:
     bool applyStateJson(const std::string& json);
     /// 4: channels matched by name (desks up to 3 were matched by slot, with
     /// the name only a guard, and lost every channel a new one had moved).
-    static constexpr int kDeskVersion = 4;
+    /// 5: a desk older than this onto a build with one sample engine gets
+    /// that engine rescued once if it would load silent -- muted, at zero,
+    /// or sent only to outputs nobody hears -- because 4 had already put the
+    /// unused streamer's settings on it and saved them (2026-10-09).
+    static constexpr int kDeskVersion = 5;
+    /// The last applyStateJson() loaded a desk older than kDeskVersion: the
+    /// platform saves it back once, so a rescue is not repeated on every boot
+    /// over what the player does next.
+    bool deskMigrated() const { return deskMigrated_; }
 
     /// Called from non-render threads after the GUI mutates routing/volumes.
     /// Use it to flush state to disk / NVS without putting platform-specific
@@ -297,6 +305,8 @@ private:
     /// a hint; @p taken holds the slots an earlier entry of the same desk
     /// already went to.
     int slotForSaved(int id, const char* name, const bool* taken) const;
+
+    bool deskMigrated_ = false;   ///< see deskMigrated(); under registrationMutex_
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];

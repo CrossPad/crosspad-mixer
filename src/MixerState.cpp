@@ -130,7 +130,10 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
     JsonDocument doc;
     if (deserializeJson(doc, json)) return false;
 
-    /* Every version so far (2..4) saved each channel with its slot and its
+    const int version = doc["version"] | 0;
+    deskMigrated_ = version < kDeskVersion;
+
+    /* Every version so far (2..5) saved each channel with its slot and its
      * name, so one rule loads them all: the name decides (slotForSaved()). A
      * desk saved by firmware without "Sampler2" puts USB, Click and the
      * inputs back on USB, Click and the inputs, not one slot early; a desk
@@ -159,18 +162,27 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
     for (JsonObject c : channelsArr) {
         if (std::strcmp(c["name"] | "", "Sampler2") == 0) deskHasSampler2 = true;
     }
-    const int engineSlot = (deskHasSampler2 && liveSlot("Sampler2") < 0) ? liveSlot("Sampler") : -1;
-    /* The routes this build gave its engine at boot, for the check below. */
-    bool bootRoute[kMixerMaxOutputs] = {};
-    if (engineSlot >= 0) {
+    /* This build's only sample engine: "Sampler" with no "Sampler2" beside it. */
+    const int soleEngine = liveSlot("Sampler2") < 0 ? liveSlot("Sampler") : -1;
+    /* Sampler2's settings go onto it (above). */
+    const bool foldEngines = deskHasSampler2 && soleEngine >= 0;
+    /* And it is rescued if it would load silent -- on that fold, and on any
+     * desk older than v5, which is how a desk the fold should have healed but
+     * v4 had already loaded wrongly (and saved again) gets healed too. */
+    const bool rescueEngine = soleEngine >= 0 && (foldEngines || deskMigrated_);
+    /* What this build gave its engine at boot, for the rescue below. */
+    bool  bootRoute[kMixerMaxOutputs] = {};
+    float bootRouteVol[kMixerMaxOutputs] = {};
+    if (rescueEngine) {
         for (uint8_t o = 0; o < kMixerMaxOutputs; ++o) {
-            bootRoute[o] = channels_[engineSlot].routeEnabled[o].load(std::memory_order_relaxed);
+            bootRoute[o] = channels_[soleEngine].routeEnabled[o].load(std::memory_order_relaxed);
+            bootRouteVol[o] = channels_[soleEngine].routeVol[o].load(std::memory_order_relaxed);
         }
     }
 
     for (JsonObject c : channelsArr) {
         const char* savedName = c["name"] | "";
-        if (engineSlot >= 0) {
+        if (foldEngines) {
             if (std::strcmp(savedName, "Sampler") == 0) continue;     // the streamer's
             if (std::strcmp(savedName, "Sampler2") == 0) savedName = "Sampler";
         }
@@ -191,27 +203,61 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         }
     }
 
-    /* The one sample engine of this build must not come out of that
-     * migration silent: a desk where Sampler2 was muted (the streamer was in
-     * use) or sent nowhere would leave the pads dead with nothing on the
-     * Mixer saying why. Unmuted, and given back the routes it booted with;
-     * its level and pan stay the desk's. Only on this migration -- a muted
-     * Sampler from a desk of this layout is the player's choice. */
-    if (engineSlot >= 0) {
-        auto& eng = channels_[engineSlot];
+    /* The one sample engine of this build must not come out of a migration
+     * silent: a desk where Sampler2 was muted (the streamer was in use), or
+     * one v4 had already given the streamer's settings and saved, would leave
+     * the pads dead with nothing on the Mixer saying why. Silent is muted, at
+     * zero, or with no route it is heard on -- none enabled, every one at
+     * zero, or only to an output nobody hears (the USB rec bus). It is
+     * unmuted, brought to unity if it was at zero, and given the routes it
+     * booted with; its pan and any level above zero stay the desk's. Only on
+     * a migration -- a silent Sampler on a v5 desk is the player's choice --
+     * and once: the platform saves the desk back (deskMigrated()). */
+    if (rescueEngine) {
+        auto& eng = channels_[soleEngine];
         if (eng.muted.load(std::memory_order_relaxed)) {
             eng.muted.store(false, std::memory_order_relaxed);
-            printf("[Mixer] desk migration: Sampler2 -> Sampler loaded muted, unmuted\n");
+            printf("[Mixer] desk v%d: the sample engine loaded muted, unmuted\n", version);
         }
-        bool anyRoute = false;
+        if (!(eng.volume.load(std::memory_order_relaxed) > 0.0f)) {
+            eng.volume.store(1.0f, std::memory_order_relaxed);
+            printf("[Mixer] desk v%d: the sample engine loaded at zero, set to unity\n", version);
+        }
+        bool heard = false;
         for (uint8_t o = 0; o < numOutputs_; ++o) {
-            anyRoute = anyRoute || eng.routeEnabled[o].load(std::memory_order_relaxed);
+            heard = heard || (outputs_[o].heard.load(std::memory_order_relaxed) &&
+                              eng.routeEnabled[o].load(std::memory_order_relaxed) &&
+                              eng.routeVol[o].load(std::memory_order_relaxed) > 0.0f);
         }
-        if (!anyRoute) {
+        if (!heard) {
             for (uint8_t o = 0; o < kMixerMaxOutputs; ++o) {
-                eng.routeEnabled[o].store(bootRoute[o], std::memory_order_relaxed);
+                if (!bootRoute[o]) continue;
+                eng.routeEnabled[o].store(true, std::memory_order_relaxed);
+                if (!(eng.routeVol[o].load(std::memory_order_relaxed) > 0.0f)) {
+                    eng.routeVol[o].store(bootRouteVol[o] > 0.0f ? bootRouteVol[o] : 1.0f,
+                                          std::memory_order_relaxed);
+                }
             }
-            printf("[Mixer] desk migration: Sampler2 -> Sampler had no route, boot routes restored\n");
+            printf("[Mixer] desk v%d: the sample engine had no heard route, boot routes restored\n",
+                   version);
+        }
+    }
+
+    /* Said, not changed: an input that loads sent to an output is a live
+     * microphone or line on the speakers from boot, which is how a noise
+     * floor nobody asked for reaches a recording (rt_glitch, 2026-10-09). */
+    static const char* const kInputs[] = {"IN1", "IN2", "IN3", "Mic", "Line"};
+    for (int ch = 0; ch < kMixerMaxChannels; ++ch) {
+        const auto& in = channels_[ch];
+        if (!in.active.load(std::memory_order_acquire)) continue;
+        bool isInput = false;
+        for (const char* n : kInputs) isInput = isInput || std::strcmp(in.name, n) == 0;
+        if (!isInput || in.muted.load(std::memory_order_relaxed)) continue;
+        for (uint8_t o = 0; o < numOutputs_; ++o) {
+            if (in.routeEnabled[o].load(std::memory_order_relaxed) &&
+                in.routeVol[o].load(std::memory_order_relaxed) > 0.0f) {
+                printf("[Mixer] desk: input %s loads routed to output %u\n", in.name, (unsigned)o);
+            }
         }
     }
 

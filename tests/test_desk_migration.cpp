@@ -99,22 +99,33 @@ void checkAllDressed(const Desk& d) {
     checkDressed(d, "IN3",     0.45f,  0.30f, false, false);
 }
 
-/* What the board's firmware wrote before this change: version 3, each
- * channel with its slot in *that* build. */
-std::string asVersion3(std::string json) {
-    const std::string v4 = "\"version\":4";
-    const auto at = json.find(v4);
+/* A desk as an older firmware wrote it: the same channels, an older version
+ * number (3: each channel with its slot in *that* build; 4: by name, before
+ * the one-engine rescue). */
+std::string asVersion(std::string json, int v) {
+    const std::string now = "\"version\":" + std::to_string(AudioMixerEngine::kDeskVersion);
+    const auto at = json.find(now);
     REQUIRE(at != std::string::npos);
-    json.replace(at, v4.size(), "\"version\":3");
+    json.replace(at, now.size(), "\"version\":" + std::to_string(v));
     return json;
+}
+std::string asVersion3(std::string json) { return asVersion(std::move(json), 3); }
+
+/* The board's own set-up of the one-engine layout: Sampler sent to both
+ * codecs and the USB rec bus, which is not heard (CrosspadPlatform.cpp). */
+constexpr uint8_t kRecBus = 2;
+void bootRouting(Desk& d) {
+    d.m.setOutputHeard(kRecBus, false);
+    const int s = d.slot("Sampler");
+    for (uint8_t o = 0; o < kOuts; ++o) d.m.setRouteEnabled(s, o, true);
 }
 
 }  // namespace
 
-TEST_CASE("the desk is saved as version 4", "[desk]") {
+TEST_CASE("the desk is saved as version 5", "[desk]") {
     Desk d(kMainLayout);
-    CHECK(d.m.stateJson().find("\"version\":4") != std::string::npos);
-    CHECK(AudioMixerEngine::kDeskVersion == 4);
+    CHECK(d.m.stateJson().find("\"version\":5") != std::string::npos);
+    CHECK(AudioMixerEngine::kDeskVersion == 5);
 }
 
 TEST_CASE("a desk saved by main (v3, no Sampler2) loads onto the right channels of the two-engine build", "[desk]") {
@@ -255,4 +266,106 @@ TEST_CASE("two saved entries never land on one channel", "[desk]") {
     CHECK_THAT(now.m.getChannelVolume(now.slot("USB")), WithinAbs(0.3f, kJsonEps));
     CHECK_FALSE(now.m.isChannelMuted(now.slot("USB")));
     CHECK(now.m.getChannelVolume(5) == 1.0f);   // IN2 untouched
+}
+
+
+// ── Desks already migrated wrongly and saved again (merge re-review N2) ────
+
+namespace {
+/* A desk from the one-engine image before v5: Sampler2's settings never
+ * reached Sampler, the streamer's did, and the desk was saved like that. */
+std::string oldOneEngineDesk(void (*spoil)(Desk&)) {
+    Desk old(kMainLayout);
+    bootRouting(old);
+    dressAll(old);
+    spoil(old);
+    return asVersion(old.m.stateJson(), 4);
+}
+bool heardRoute(const Desk& d, int ch) {
+    for (uint8_t o = 0; o < kOuts; ++o) {
+        if (d.m.isOutputHeard(o) && d.m.isRouteEnabled(ch, o) && d.m.getRouteVolume(ch, o) > 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+TEST_CASE("a v4 desk whose only engine is muted or at zero is rescued once", "[desk]") {
+    const std::string saved = oldOneEngineDesk([](Desk& d) {
+        const int s = d.slot("Sampler");
+        d.m.setChannelMute(s, true);
+        d.m.setChannelVolume(s, 0.0f);
+    });
+    Desk now(kMainLayout);
+    bootRouting(now);
+    REQUIRE(now.m.applyStateJson(saved));
+    const int s = now.slot("Sampler");
+    CHECK_FALSE(now.m.isChannelMuted(s));
+    CHECK(now.m.getChannelVolume(s) == 1.0f);
+    CHECK(now.m.deskMigrated());                  // the board saves it back as v5
+    checkDressed(now, "Pitched", 0.80f, 0.20f, true, false);   // nothing else touched
+
+    /* Saved as v5 and loaded again: the player's own mute from then on stays. */
+    now.m.setChannelMute(s, true);
+    Desk again(kMainLayout);
+    bootRouting(again);
+    REQUIRE(again.m.applyStateJson(now.m.stateJson()));
+    CHECK(again.m.isChannelMuted(again.slot("Sampler")));
+    CHECK_FALSE(again.m.deskMigrated());
+}
+
+TEST_CASE("a v4 desk whose only engine goes only to the rec bus gets its heard routes back", "[desk]") {
+    const std::string saved = oldOneEngineDesk([](Desk& d) {
+        const int s = d.slot("Sampler");
+        d.m.setRouteEnabled(s, 0, false);
+        d.m.setRouteEnabled(s, 1, false);
+        d.m.setRouteEnabled(s, kRecBus, true);
+    });
+    Desk now(kMainLayout);
+    bootRouting(now);
+    REQUIRE(now.m.applyStateJson(saved));
+    const int s = now.slot("Sampler");
+    CHECK(now.m.isRouteEnabled(s, 0));
+    CHECK(now.m.isRouteEnabled(s, 1));
+    CHECK(heardRoute(now, s));
+}
+
+TEST_CASE("a v4 desk whose only engine is routed at zero gets its route levels back", "[desk]") {
+    const std::string saved = oldOneEngineDesk([](Desk& d) {
+        const int s = d.slot("Sampler");
+        for (uint8_t o = 0; o < kOuts; ++o) d.m.setRouteVolume(s, o, 0.0f);
+    });
+    Desk now(kMainLayout);
+    bootRouting(now);
+    REQUIRE(now.m.applyStateJson(saved));
+    CHECK(heardRoute(now, now.slot("Sampler")));
+}
+
+TEST_CASE("a v5 desk's silent engine is the player's choice and stays silent", "[desk]") {
+    Desk old(kMainLayout);
+    bootRouting(old);
+    const int so = old.slot("Sampler");
+    old.m.setChannelMute(so, true);
+    old.m.setChannelVolume(so, 0.0f);
+    old.m.setRouteEnabled(so, 0, false);
+    old.m.setRouteEnabled(so, 1, false);
+    Desk now(kMainLayout);
+    bootRouting(now);
+    REQUIRE(now.m.applyStateJson(old.m.stateJson()));
+    const int s = now.slot("Sampler");
+    CHECK(now.m.isChannelMuted(s));
+    CHECK(now.m.getChannelVolume(s) == 0.0f);
+    CHECK_FALSE(heardRoute(now, s));
+    CHECK_FALSE(now.m.deskMigrated());
+}
+
+TEST_CASE("a v4 desk on the two-engine build is migrated but no engine is rescued", "[desk]") {
+    Desk old(kTwoEngineLayout);
+    dressAll(old);
+    old.m.setChannelMute(old.slot("Sampler2"), true);
+    Desk now(kTwoEngineLayout);
+    REQUIRE(now.m.applyStateJson(asVersion(old.m.stateJson(), 4)));
+    CHECK(now.m.isChannelMuted(now.slot("Sampler2")));   // two engines: no "only" one
+    CHECK(now.m.deskMigrated());
 }
