@@ -46,6 +46,7 @@ function(mixer_tests target)
     add_executable(${target}
         ${TEST_SOURCES}
         ${MIXER_DIR}/src/AudioMixerEngine.cpp
+        ${MIXER_DIR}/src/MixerState.cpp       # the desk as JSON (split out to build it -Os)
         ${CROSSPAD_CORE_DIR}/src/audio/OutputEq.cpp   # the EQ across the outputs (0.9.x)
     )
     target_include_directories(${target} PRIVATE

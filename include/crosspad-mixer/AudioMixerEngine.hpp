@@ -205,11 +205,20 @@ public:
     void loadState(const std::string& path);
 
     /// The same state as a JSON string, for a platform that keeps it
-    /// somewhere other than a file (NVS on the board).
+    /// somewhere other than a file (NVS on the board). Desk format
+    /// kDeskVersion: every channel carries its name, and the name -- not the
+    /// slot -- is what it is loaded back onto.
     std::string stateJson() const;
-    /// Apply a string from stateJson(). False when it does not parse, in
+    /// Apply a string from stateJson(), of this version or an older one.
+    /// Each saved channel goes to the live channel of the same name wherever
+    /// it now sits, so a build that inserts a channel (the native sampler's
+    /// "Sampler2", 2026-10) or drops one loads an older desk onto the right
+    /// channels instead of shifting them. False when it does not parse, in
     /// which case nothing is changed.
     bool applyStateJson(const std::string& json);
+    /// 4: channels matched by name (desks up to 3 were matched by slot, with
+    /// the name only a guard, and lost every channel a new one had moved).
+    static constexpr int kDeskVersion = 4;
 
     /// Called from non-render threads after the GUI mutates routing/volumes.
     /// Use it to flush state to disk / NVS without putting platform-specific
@@ -282,6 +291,12 @@ private:
     };
 
     void resetChannelSlot(ChannelSlot& s);
+
+    /// The live slot a saved channel's settings belong to, or -1. Under
+    /// registrationMutex_. See applyStateJson(): by name, the saved id only
+    /// a hint; @p taken holds the slots an earlier entry of the same desk
+    /// already went to.
+    int slotForSaved(int id, const char* name, const bool* taken) const;
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
