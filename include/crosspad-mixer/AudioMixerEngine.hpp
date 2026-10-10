@@ -26,12 +26,16 @@
 #include <string>
 #include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
+#include <crosspad/audio/OutputEq.hpp>
 
 namespace crosspad { class IAudioNode; }
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 static constexpr uint8_t kMixerMaxChannels = 16;
 static constexpr uint8_t kMixerMaxOutputs  = 8;
+/// Outputs that can carry an EQ: the first two, which on every board so far
+/// are the speakers and the headphones.
+static constexpr uint8_t kMixerEqOutputs   = 2;
 static constexpr uint8_t kMixerInvalidChannelId = 0xFF;
 static constexpr uint8_t kMixerNameLen = 24;
 
@@ -105,6 +109,23 @@ public:
     void setOutputHeard(OutputId out, bool heard);
     bool isOutputHeard(OutputId out) const;
 
+    // ── Output EQ ──────────────────────────────────────────────────────────
+    //
+    // Four bands across an output, for evening out what it plays through: a
+    // speaker this size has a response, and so does a headphone amp, and the
+    // two are not each other's. It sits where a console's monitor EQ sits --
+    // after the mix, before that output's own fader -- so a band that lifts
+    // something leaves the fader to take it back, and nothing downstream of
+    // the correction can undo it.
+    //
+    // Saved with the desk (stateJson), so a board keeps its correction.
+
+    /// Not from the render thread: the coefficients are worked out here.
+    void setOutputEq(OutputId out, const crosspad::EqSettings& eq);
+    crosspad::EqSettings getOutputEq(OutputId out) const;
+    /// Whether that output's EQ is doing anything at all.
+    bool isOutputEqActive(OutputId out) const;
+
     // ── Routing matrix ─────────────────────────────────────────────────────
 
     void  setRouteEnabled(ChannelId ch, OutputId out, bool enabled);
@@ -149,6 +170,24 @@ public:
     /// `outBuses[i]` must point to a buffer of `frames * 2` floats. Audio
     /// thread only — single writer.
     void render(float* const* outBuses, uint8_t numOut, uint32_t frames);
+
+    /* ── Where a render pass goes, per channel ────────────────────────────
+     *
+     * `TASKS` said audio_rt costs 42 % of core 1 at the launcher with no kit
+     * loaded, and RT_PROF narrowed that to 1040 us a block inside this
+     * render -- for 64 frames, three buses and nothing playing. Which part
+     * of it was not answerable without timing the pass from inside, so:
+     * every channel's node, and the four stages around them.
+     *
+     * The clock comes from the platform (one cycle-counter read on the
+     * board, nothing on a host) and the whole thing is off until asked for,
+     * so a render that is not being profiled pays one relaxed bool load. */
+    using CycFn = uint32_t (*)();
+    void setProfClock(CycFn fn) { cyc_ = fn; }
+    void profEnable(bool on);
+    /// Mean microseconds per pass, per channel and per stage. Reads, clears.
+    /// @p cpuMhz the clock the counter runs at.
+    void profRead(char* out, uint32_t cap, float cpuMhz);
     /// RT, right after render(): the channels in @p chs as they went into the
     /// mix -- panned, at their fader, silent when muted or left out by a solo
     /// -- summed into @p out, whatever they are sent to. A tap the routing
@@ -166,11 +205,28 @@ public:
     void loadState(const std::string& path);
 
     /// The same state as a JSON string, for a platform that keeps it
-    /// somewhere other than a file (NVS on the board).
+    /// somewhere other than a file (NVS on the board). Desk format
+    /// kDeskVersion: every channel carries its name, and the name -- not the
+    /// slot -- is what it is loaded back onto.
     std::string stateJson() const;
-    /// Apply a string from stateJson(). False when it does not parse, in
+    /// Apply a string from stateJson(), of this version or an older one.
+    /// Each saved channel goes to the live channel of the same name wherever
+    /// it now sits, so a build that inserts a channel (the native sampler's
+    /// "Sampler2", 2026-10) or drops one loads an older desk onto the right
+    /// channels instead of shifting them. False when it does not parse, in
     /// which case nothing is changed.
     bool applyStateJson(const std::string& json);
+    /// 4: channels matched by name (desks up to 3 were matched by slot, with
+    /// the name only a guard, and lost every channel a new one had moved).
+    /// 5: a desk older than this onto a build with one sample engine gets
+    /// that engine rescued once if it would load silent -- muted, at zero,
+    /// or sent only to outputs nobody hears -- because 4 had already put the
+    /// unused streamer's settings on it and saved them (2026-10-09).
+    static constexpr int kDeskVersion = 5;
+    /// The last applyStateJson() loaded a desk older than kDeskVersion: the
+    /// platform saves it back once, so a rescue is not repeated on every boot
+    /// over what the player does next.
+    bool deskMigrated() const { return deskMigrated_; }
 
     /// Called from non-render threads after the GUI mutates routing/volumes.
     /// Use it to flush state to disk / NVS without putting platform-specific
@@ -244,8 +300,21 @@ private:
 
     void resetChannelSlot(ChannelSlot& s);
 
+    /// The live slot a saved channel's settings belong to, or -1. Under
+    /// registrationMutex_. See applyStateJson(): by name, the saved id only
+    /// a hint; @p taken holds the slots an earlier entry of the same desk
+    /// already went to.
+    int slotForSaved(int id, const char* name, const bool* taken) const;
+
+    bool deskMigrated_ = false;   ///< see deskMigrated(); under registrationMutex_
+
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
+    /* One per output that can be EQ'd -- the ones a board plays through, not
+     * all eight slots. Internal RAM on this hardware is counted in hundreds
+     * of bytes at boot (see EqChain), and an EQ across a recording bus is
+     * not a thing anybody asked for. */
+    crosspad::EqChain outputEq_[kMixerEqOutputs];
 
     std::atomic<crosspad::AudioRingBuffer<int16_t>*> tapBuffer_{nullptr};
     std::atomic<uint8_t> tapOutput_{0};
@@ -253,6 +322,18 @@ private:
     uint32_t frameCount_   = 0;
     uint32_t sampleRate_   = 0;
     uint8_t  numOutputs_   = 2;
+
+    CycFn                 cyc_ = nullptr;
+    std::atomic<bool>     prof_{false};
+    std::atomic<uint32_t> profPasses_{0};
+    /* Sums in units of 1 << kProfShift cycles, 32-bit: render() adds to them
+     * every pass, and a 64-bit atomic is not lock-free on the S3. A whole
+     * 1.45 ms pass is ~21 800 units at 240 MHz, so a sum wraps only after
+     * ~3 minutes unread; profRead() reads and clears. */
+    static constexpr uint32_t kProfShift = 4;
+    static uint32_t profUnits(uint32_t cycles) { return (cycles + (1u << (kProfShift - 1))) >> kProfShift; }
+    std::atomic<uint32_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint32_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
 

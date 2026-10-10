@@ -6,7 +6,7 @@
 #   cmake -S tests -B tests/build && cmake --build tests/build && ctest --test-dir tests/build
 # Offline, point FetchContent at sources already on disk, e.g. crosspad-core's:
 #   -DFETCHCONTENT_SOURCE_DIR_CATCH2=<dir> -DFETCHCONTENT_SOURCE_DIR_ARDUINOJSON=<dir>
-# crosspad-core is used for its headers only; by default it is the sibling
+# crosspad-core is used for its headers (and OutputEq.cpp); by default it is the sibling
 # component of a platform checkout, else pass -DCROSSPAD_CORE_DIR=<path>.
 
 cmake_minimum_required(VERSION 3.14)
@@ -46,6 +46,8 @@ function(mixer_tests target)
     add_executable(${target}
         ${TEST_SOURCES}
         ${MIXER_DIR}/src/AudioMixerEngine.cpp
+        ${MIXER_DIR}/src/MixerState.cpp       # the desk as JSON (split out to build it -Os)
+        ${CROSSPAD_CORE_DIR}/src/audio/OutputEq.cpp   # the EQ across the outputs (0.9.x)
     )
     target_include_directories(${target} PRIVATE
         ${MIXER_DIR}/include
