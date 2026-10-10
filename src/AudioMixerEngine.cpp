@@ -17,6 +17,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -33,6 +34,18 @@ AudioMixerEngine::AudioMixerEngine() {
 }
 
 AudioMixerEngine::~AudioMixerEngine() = default;
+
+/* How long the limiter takes to let go: slow enough that a bass note is not
+ * pumped into distortion by its own cycles, fast enough that a loud hit does
+ * not duck the next bar. */
+static constexpr float kLimReleaseS = 0.2f;
+/* How long the gain stays where a peak put it before letting go at all. Per
+ * block, a release between the crests of one loud note and a cut back at the
+ * next crest moves the gain with the waveform -- the limiter turned into a
+ * waveshaper, heard as drive. Modelled block for block (10.10.2026): a 40 Hz
+ * sine 6 dB over the ceiling came out at THD -36 dB, -77 dB with this hold;
+ * 60 Hz + 7 kHz IMD -40 -> -57 dB. Longer than a 20 Hz period. */
+static constexpr float kLimHoldS = 0.05f;
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -57,6 +70,13 @@ void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t n
     // Render hot path uses this for the (channel × gain) product before
     // accumulating into the output bus (esp-dsp two-pass MAC). Sized once.
     if (mixScratch_.size() < stereoSamples) mixScratch_.assign(stereoSamples, 0.0f);
+    for (auto& o : outputs_) {
+        if (o.lookahead.load(std::memory_order_relaxed)) o.held.assign(stereoSamples, 0.0f);
+    }
+
+    limRelease_ = sampleRate ? 1.0f - std::exp(-(float)frameCount / ((float)sampleRate * kLimReleaseS))
+                             : 1.0f;
+    limHoldBlocks_ = frameCount ? (uint16_t)std::ceil(kLimHoldS * (float)sampleRate / (float)frameCount) : 0;
 }
 
 void AudioMixerEngine::resetChannelSlot(ChannelSlot& s) {
@@ -327,7 +347,7 @@ void AudioMixerEngine::getOutputLevel(OutputId out, int16_t& left, int16_t& righ
 
 // ── Render (single audio thread) ──────────────────────────────────────────
 
-void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) const {
+void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) {
     const uint32_t stereo = frames * 2;
     std::memset(out, 0, stereo * sizeof(float));
     bool anySoloed = false;
@@ -347,6 +367,136 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
         const float* src = slot.scratch.data();
         for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
     }
+    limit(out, frames, kLimitCeiling, tapLimGain_, tapLimHold_, tapLimMin_);
+}
+
+void AudioMixerEngine::setOutputCeiling(OutputId out, float ceiling) {
+    if (out >= kMixerMaxOutputs) return;
+    if (ceiling > kLimitCeiling) ceiling = kLimitCeiling;
+    if (ceiling < 0.01f) ceiling = 0.01f;
+    outputs_[out].ceiling.store(ceiling, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getOutputCeiling(OutputId out) const {
+    if (out >= kMixerMaxOutputs) return kLimitCeiling;
+    return outputs_[out].ceiling.load(std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::setOutputLookahead(OutputId out, bool on) {
+    if (out >= kMixerMaxOutputs) return;
+    OutputSlot& o = outputs_[out];
+    /* Sized before the flag is published, and only the first time: the
+     * render reads `held` only behind an acquire of `lookahead`. */
+    if (on && o.held.empty()) o.held.assign((size_t)frameCount_ * 2, 0.0f);
+    o.lookahead.store(on, std::memory_order_release);
+}
+
+float AudioMixerEngine::takeOutputLimit(OutputId out) {
+    if (out == kTapLimit) return tapLimMin_.exchange(1.0f, std::memory_order_relaxed);
+    if (out >= numOutputs_) return 1.0f;
+    return outputs_[out].limMin.exchange(1.0f, std::memory_order_relaxed);
+}
+
+/* A peak limiter in place of the hard clip at full scale.
+ *
+ * Nothing in the mix keeps headroom of its own: the sample engines sum their
+ * voices at unity and a fader goes to +6 dB. Sixteen pads at once put 1.66 on
+ * the Sampler2 channel, so with the output fader near 0 dB the clamp in
+ * render() cut the tops off -- heard as distortion -- and the pads tap, with
+ * no fader at all, wrote it into every bounce and take (09.10.2026).
+ *
+ * Per block, which the render has whole before any of it leaves: the gain
+ * comes down to what the block's peak allows and goes back towards unity
+ * over kLimReleaseS, once kLimHoldS has passed without a block that needed it
+ * where it is. A block below the ceiling with the gain back at 1 is only
+ * scanned. The clamp in render() stays; nothing should reach it now. */
+void AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
+                             std::atomic<float>& deepest) {
+    const float over = gain > 0.0f ? ceiling / gain : 0.0f;   // what the gain as it stands lets through
+    float peak = 0.0f;
+    uint32_t first = frames;
+    for (uint32_t i = 0; i < frames; ++i) {
+        float l = buf[i * 2 + 0]; if (l < 0) l = -l;
+        float r = buf[i * 2 + 1]; if (r < 0) r = -r;
+        const float a = l > r ? l : r;
+        if (a > peak) peak = a;
+        if (first == frames && a > over) first = i;
+    }
+    const float want = peak > ceiling ? ceiling / peak : 1.0f;
+    if (want <= gain) hold = limHoldBlocks_;
+    if (gain >= 1.0f && want >= 1.0f) return;
+
+    /* Down by the first frame the present gain would let over the ceiling,
+     * so none does; held there for the rest of the block. Up, or down to a
+     * level nothing in the block exceeds, across the whole block. */
+    float end = gain;
+    if (hold) {
+        --hold;
+    } else {
+        end = gain + (1.0f - gain) * limRelease_;
+        if (end > 0.999f) end = 1.0f;
+    }
+    uint32_t span = frames;
+    if (want < end) {
+        end = want;
+        if (want < gain) span = first + 1;
+    }
+    const float step = (end - gain) / (float)span;
+    float g = gain;
+    for (uint32_t i = 0; i < frames; ++i) {
+        if (i < span) g += step;
+        buf[i * 2 + 0] *= g;
+        buf[i * 2 + 1] *= g;
+    }
+    gain = end;
+    if (end < deepest.load(std::memory_order_relaxed)) deepest.store(end, std::memory_order_relaxed);
+}
+
+/* limit() a block late. Coming down within the frames before a peak is a step
+ * when the peak is near the start of a block -- and on the USB recording bus,
+ * with no fader in front of it, a chord in 16 levels of pitch put one there on
+ * every hit: lim 0.367, clicks in the take and none on the jacks (10.10.2026).
+ *
+ * Here what leaves is the block held back, and the one coming in is known, so
+ * the gain reaches what both need by the end of the outgoing block, in one
+ * ramp across it. Nothing gets over the ceiling: the gain this block starts
+ * at was already low enough for it a block ago (it was the incoming one
+ * then), a ramp down only goes lower, and a ramp up ends where both allow. */
+void AudioMixerEngine::limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling) {
+    float* held = o.held.data();
+    const uint32_t stereo = frames * 2;
+    float peak = 0.0f;   // the incoming block's, which leaves next time
+    for (uint32_t i = 0; i < stereo; ++i) {
+        const float a = buf[i] < 0 ? -buf[i] : buf[i];
+        if (a > peak) peak = a;
+    }
+    /* Only a ceiling lowered since the last block -- a jack turned up -- can
+     * leave the starting gain too high for the held block. */
+    float g = o.limGain;
+    if (o.heldPeak * g > ceiling) g = ceiling / o.heldPeak;
+    const float worst = peak > o.heldPeak ? peak : o.heldPeak;
+    if (worst * g >= ceiling) o.limHold = limHoldBlocks_;
+    float end = g;
+    if (o.limHold) {
+        --o.limHold;
+    } else {
+        end = g + (1.0f - g) * limRelease_;
+        if (end > 0.999f) end = 1.0f;
+    }
+    if (worst * end > ceiling) end = ceiling / worst;
+
+    const float step = (end - g) / (float)frames;
+    for (uint32_t i = 0; i < frames; ++i) {
+        g += step;
+        const float l = buf[i * 2 + 0], r = buf[i * 2 + 1];
+        buf[i * 2 + 0] = held[i * 2 + 0] * g;
+        buf[i * 2 + 1] = held[i * 2 + 1] * g;
+        held[i * 2 + 0] = l;
+        held[i * 2 + 1] = r;
+    }
+    o.heldPeak = peak;
+    o.limGain = end;
+    if (end < o.limMin.load(std::memory_order_relaxed)) o.limMin.store(end, std::memory_order_relaxed);
 }
 
 void AudioMixerEngine::profEnable(bool on)
@@ -495,11 +645,12 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     const uint32_t cRoute1 = prof ? cyc_() : 0;
     if (prof) profRoute_.fetch_add(cRoute1 - cRoute0, std::memory_order_relaxed);
 
-    // 5. Per-output volume + clamp + meter
+    // 5. Per-output volume + limiter + clamp + meter
     //
-    // dsps_mulc_f32 runs in-place to apply the master output gain, then a
-    // scalar pass handles clamp + peak tracking (esp-dsp has no clamp/abs-
-    // max helper that fits this layout, and the scalar loop fuses fine).
+    // dsps_mulc_f32 runs in-place to apply the master output gain, then the
+    // limiter, then a scalar pass handles clamp + peak tracking (esp-dsp has
+    // no clamp/abs-max helper that fits this layout, and the scalar loop
+    // fuses fine).
     for (uint8_t o = 0; o < numOut; ++o) {
         const bool  oMuted = outputs_[o].muted.load(std::memory_order_relaxed);
         const float oVol   = outputs_[o].volume.load(std::memory_order_relaxed);
@@ -510,6 +661,12 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             /* The sections forget where they were: coming back from mute
              * should not play out what was in them a minute ago. */
             if (o < kMixerEqOutputs) outputEq_[o].reset();
+            outputs_[o].limGain = 1.0f;
+            outputs_[o].limHold = 0;
+            if (outputs_[o].lookahead.load(std::memory_order_acquire)) {
+                std::fill(outputs_[o].held.begin(), outputs_[o].held.end(), 0.0f);
+                outputs_[o].heldPeak = 0.0f;
+            }
         } else {
             /* The correction, then the fader. */
             if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
@@ -518,6 +675,15 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
 #else
             for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
 #endif
+            OutputSlot& os = outputs_[o];
+            const float ceiling = os.ceiling.load(std::memory_order_relaxed);
+            /* Held back only by exactly one block: a call of another length
+             * would hand out frames that are not the ones before. */
+            if (os.lookahead.load(std::memory_order_acquire) && os.held.size() == stereo) {
+                limitAhead(os, dst, frames, ceiling);
+            } else {
+                limit(dst, frames, ceiling, os.limGain, os.limHold, os.limMin);
+            }
         }
 
         float pL = 0.0f, pR = 0.0f;

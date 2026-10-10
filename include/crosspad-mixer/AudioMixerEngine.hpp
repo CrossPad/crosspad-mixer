@@ -154,6 +154,19 @@ public:
     float getOutputVolume(OutputId out) const;
     void  setOutputMute  (OutputId out, bool muted);
     bool  isOutputMuted  (OutputId out) const;
+    /// The highest peak the limiter lets out of @p out (0..kLimitCeiling):
+    /// lower where what follows the output -- a codec's analog stage turned
+    /// up past 0 dB -- cannot carry a full-scale peak.
+    static constexpr float kLimitCeiling = 0.98f;
+    void  setOutputCeiling(OutputId out, float ceiling);
+    float getOutputCeiling(OutputId out) const;
+    /// Hold @p out back one block, so its limiter sees a peak a block before
+    /// it leaves and brings the gain down across that whole block instead of
+    /// in the frames just before it -- which on a sustained sound is a step,
+    /// heard as a click. Costs the output one block of latency, so it is for
+    /// a bus that is only recorded (a USB recording bus), never one a player
+    /// hears. Not from the render thread.
+    void  setOutputLookahead(OutputId out, bool on);
 
     // ── Metering (float [0.0, 1.0]) ────────────────────────────────────────
 
@@ -163,6 +176,11 @@ public:
     // Legacy int16 overloads for existing UI code (rescales internally)
     void getChannelLevel(ChannelId ch, int16_t& left, int16_t& right) const;
     void getOutputLevel (OutputId out, int16_t& left, int16_t& right) const;
+
+    /// The limiter's deepest gain on @p out since the last read (1.0 = it
+    /// never acted), and resets it. kTapLimit reads the pads tap's.
+    static constexpr OutputId kTapLimit = 0xFF;
+    float takeOutputLimit(OutputId out);
 
     // ── Render ─────────────────────────────────────────────────────────────
 
@@ -191,8 +209,9 @@ public:
     /// RT, right after render(): the channels in @p chs as they went into the
     /// mix -- panned, at their fader, silent when muted or left out by a solo
     /// -- summed into @p out, whatever they are sent to. A tap the routing
-    /// must not decide, such as the pads alone for a bounce.
-    void renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) const;
+    /// must not decide, such as the pads alone for a bounce. Limited as an
+    /// output is: a bounce of a dense part must not be a clipped file.
+    void renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames);
 
     // ── Tap (CI/test capture) ──────────────────────────────────────────────
 
@@ -279,7 +298,21 @@ private:
         std::atomic<bool>  heard{true};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
+        std::atomic<float> ceiling{kLimitCeiling};
+        float              limGain = 1.0f;   // render thread only
+        std::atomic<float> limMin{1.0f};     // deepest limGain since the last read
+        uint16_t           limHold = 0;      // blocks before it may let go; render thread only
+        std::atomic<bool>  lookahead{false}; // published after `held` is sized
+        std::vector<float> held;             // the block held back, stereo
+        float              heldPeak = 0.0f;  // render thread only
     };
+
+    /* The last stage before a bus leaves the mixer, in place of a hard clip
+     * at full scale. Render thread only. */
+    void limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
+               std::atomic<float>& deepest);
+    /* limit() one block late, for an output with lookahead on. */
+    void limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling);
 
     void resetChannelSlot(ChannelSlot& s);
 
@@ -297,6 +330,12 @@ private:
     uint32_t frameCount_   = 0;
     uint32_t sampleRate_   = 0;
     uint8_t  numOutputs_   = 2;
+
+    float              limRelease_ = 0.0f;   // per-block step back to unity, from setup()
+    uint16_t           limHoldBlocks_ = 0;   // kLimHoldS in blocks, from setup()
+    float              tapLimGain_ = 1.0f;   // render thread only
+    uint16_t           tapLimHold_ = 0;      // render thread only
+    std::atomic<float> tapLimMin_{1.0f};
 
     CycFn                 cyc_ = nullptr;
     std::atomic<bool>     prof_{false};
