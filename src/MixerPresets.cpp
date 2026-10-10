@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "crosspad-mixer/MixerPresets.hpp"
 #include "crosspad-mixer/AudioMixerEngine.hpp"
