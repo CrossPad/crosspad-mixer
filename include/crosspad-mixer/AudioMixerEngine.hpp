@@ -154,6 +154,12 @@ public:
     float getOutputVolume(OutputId out) const;
     void  setOutputMute  (OutputId out, bool muted);
     bool  isOutputMuted  (OutputId out) const;
+    /// An output whose level the hardware sets after the DAC (IOutputLevels):
+    /// played at unity and never muted here, whatever a desk, a preset or a
+    /// command asks -- setOutputVolume(), setOutputMute() and a loaded state
+    /// leave it be.
+    void  setOutputUnity (OutputId out, bool unity);
+    bool  isOutputUnity  (OutputId out) const;
 
     // ── Metering (float [0.0, 1.0]) ────────────────────────────────────────
 
@@ -294,6 +300,7 @@ private:
         std::atomic<float> volume{1.0f};
         std::atomic<bool>  muted{false};
         std::atomic<bool>  heard{true};
+        std::atomic<bool>  unity{false};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
     };

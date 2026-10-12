@@ -265,8 +265,10 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
     JsonArray outArr = doc["outputs"];
     for (JsonObject ob : outArr) {
         if (idx >= kMixerMaxOutputs) break;
-        outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
-        outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
+        if (!outputs_[idx].unity.load(std::memory_order_relaxed)) {
+            outputs_[idx].volume.store(ob["volume"] | 1.0f, std::memory_order_relaxed);
+            outputs_[idx].muted .store(ob["muted"]  | false, std::memory_order_relaxed);
+        }
         /* Only a desk that has an EQ in it asks for one: an EQ's state is
          * taken on first use, and a board that has never set one should not
          * pay for it at boot. */

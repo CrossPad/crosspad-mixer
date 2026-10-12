@@ -369,3 +369,29 @@ TEST_CASE("a v4 desk on the two-engine build is migrated but no engine is rescue
     CHECK(now.m.isChannelMuted(now.slot("Sampler2")));   // two engines: no "only" one
     CHECK(now.m.deskMigrated());
 }
+
+TEST_CASE("an output held at unity keeps 1.0 and stays heard through setters and a desk", "[desk][unity]") {
+    Desk old(kMainLayout);
+    old.m.setOutputVolume(0, 0.5f);
+    old.m.setOutputMute(0, true);
+    const std::string saved = old.m.stateJson();
+
+    Desk now(kMainLayout);
+    now.m.setOutputVolume(0, 0.3f);
+    now.m.setOutputUnity(0, true);
+    CHECK(now.m.isOutputUnity(0));
+    CHECK(now.m.getOutputVolume(0) == 1.0f);
+
+    now.m.setOutputVolume(0, 0.2f);
+    now.m.setOutputMute(0, true);
+    CHECK(now.m.getOutputVolume(0) == 1.0f);
+    CHECK_FALSE(now.m.isOutputMuted(0));
+
+    REQUIRE(now.m.applyStateJson(saved));
+    CHECK(now.m.getOutputVolume(0) == 1.0f);
+    CHECK_FALSE(now.m.isOutputMuted(0));
+
+    /* The other outputs are the desk's, as before. */
+    now.m.setOutputVolume(1, 0.4f);
+    CHECK_THAT(now.m.getOutputVolume(1), WithinAbs(0.4, kJsonEps));
+}
