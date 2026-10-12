@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,10 +11,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.44.0",
+    "crosspad-core": ">=1.55.0",
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.13.0: OUT shows what a bus plays through where the board gives each its own level in the hardware (IOutputLevels, core 1.55.0): on CrossPad Speakers and Out 1/2 (one stream, held together by a bracket) and Out 3/4, each row's fader the codec's analog level after the DAC and its M a mute (the speakers' amp off). Such a bus plays at unity and is never muted in the engine (AudioMixerEngine::setOutputUnity): no fader in front of the DAC, no pass of multiplying, and a desk, a preset or MIX_OUT_VOL leave it there. render() skips the output gain at 1.0 everywhere",
     "0.11.0: desk format 4 -- a saved channel is loaded onto the live channel of the same name wherever it now sits (the slot is only a hint), so a desk saved before the native sampler's Sampler2 channel (or with it, on a build without it) keeps USB, Click and the inputs on USB, Click and the inputs; earlier desks lost those channels' settings to the name guard. The desk's JSON moved to MixerState.cpp so a platform builds it -Os and the render -O2; tests/test_desk_migration.cpp",
     "0.10.0: 0.8.1 (master: input pairs, silent channels skipped, NaN kept off the buses) and 0.9.1 (the engine branch: Source switch, IN as USB/Line/Mic, EQ across the outputs, per-channel render timing) merged; the look-up table files both the IN1/IN2/IN3 and the Line/Mic channel names",
     "0.8.1 (0.7.2 merged in): render() neither pans nor sends a channel whose block is silent (peak 0) -- the buses come out bit for bit the same, and every quiet channel saves two passes per send; a block of only NaN and zeros no longer reaches the buses (renderTap() still sums it); host tests in tests/, the scalar and the esp-dsp path",

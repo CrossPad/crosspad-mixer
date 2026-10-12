@@ -279,7 +279,7 @@ bool AudioMixerEngine::isAnySoloed() const {
 // ── Output bus control ────────────────────────────────────────────────────
 
 void AudioMixerEngine::setOutputVolume(OutputId out, float vol) {
-    if (out >= kMixerMaxOutputs) return;
+    if (out >= kMixerMaxOutputs || outputs_[out].unity.load(std::memory_order_relaxed)) return;
     outputs_[out].volume.store(vol, std::memory_order_relaxed);
 }
 
@@ -289,13 +289,26 @@ float AudioMixerEngine::getOutputVolume(OutputId out) const {
 }
 
 void AudioMixerEngine::setOutputMute(OutputId out, bool muted) {
-    if (out >= kMixerMaxOutputs) return;
+    if (out >= kMixerMaxOutputs || outputs_[out].unity.load(std::memory_order_relaxed)) return;
     outputs_[out].muted.store(muted, std::memory_order_relaxed);
 }
 
 bool AudioMixerEngine::isOutputMuted(OutputId out) const {
     if (out >= kMixerMaxOutputs) return false;
     return outputs_[out].muted.load(std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::setOutputUnity(OutputId out, bool unity) {
+    if (out >= kMixerMaxOutputs) return;
+    outputs_[out].unity.store(unity, std::memory_order_relaxed);
+    if (!unity) return;
+    outputs_[out].volume.store(1.0f, std::memory_order_relaxed);
+    outputs_[out].muted.store(false, std::memory_order_relaxed);
+}
+
+bool AudioMixerEngine::isOutputUnity(OutputId out) const {
+    if (out >= kMixerMaxOutputs) return false;
+    return outputs_[out].unity.load(std::memory_order_relaxed);
 }
 
 // ── Metering ──────────────────────────────────────────────────────────────
@@ -519,13 +532,17 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
              * should not play out what was in them a minute ago. */
             if (o < kMixerEqOutputs) outputEq_[o].reset();
         } else {
-            /* The correction, then the fader. */
+            /* The correction, then the fader -- none at unity: an output
+             * whose level the hardware sets after the DAC stays there, and
+             * a pass of multiplying by one is time the render does not have. */
             if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
+            if (oVol != 1.0f) {
 #if CROSSPAD_MIXER_USE_ESP_DSP
-            dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
+                dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
 #else
-            for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
+                for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
 #endif
+            }
         }
 
         float pL = 0.0f, pR = 0.0f;
