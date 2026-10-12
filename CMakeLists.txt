@@ -19,6 +19,11 @@ idf_component_register(
         espressif__esp-dsp
 )
 
+# render()'s esp-dsp kernels (src/AudioMixerEngine.cpp) where esp-dsp is built.
+if(IDF_TARGET STREQUAL "esp32s3")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE CROSSPAD_USE_ESP_DSP=1)
+endif()
+
 # WHOLE_ARCHIVE keeps the REGISTER_APP-generated _register_Mixer_app() symbol
 # alive through linking — main calls it via auto-generated AppRegistry_InitAll.
 set_property(TARGET ${COMPONENT_LIB} PROPERTY WHOLE_ARCHIVE ON)
