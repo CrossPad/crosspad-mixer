@@ -1585,7 +1585,7 @@ void Mixer_destroy(lv_obj_t* app_obj)
     s_prevEncGroup = nullptr;
 #endif
 
-    lv_obj_delete_async(app_obj);
+    if (app_obj) lv_obj_delete_async(app_obj);
 }
 
 // No pad logic: the pads keep playing the kit, so the mix is heard as it moves.
