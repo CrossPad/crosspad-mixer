@@ -261,6 +261,16 @@ float AudioMixerEngine::getChannelVolume(ChannelId ch) const {
     return channels_[ch].volume.load(std::memory_order_relaxed);
 }
 
+void AudioMixerEngine::setChannelTrim(ChannelId ch, float gain) {
+    if (ch >= kMixerMaxChannels) return;
+    channels_[ch].trim.store(gain < 0.0f ? 0.0f : gain, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getChannelTrim(ChannelId ch) const {
+    if (ch >= kMixerMaxChannels) return 1.0f;
+    return channels_[ch].trim.load(std::memory_order_relaxed);
+}
+
 void AudioMixerEngine::setChannelMute(ChannelId ch, bool muted) {
     if (ch >= kMixerMaxChannels) return;
     channels_[ch].muted.store(muted, std::memory_order_relaxed);
@@ -363,7 +373,7 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
         if (anySoloed && !slot.soloed.load(std::memory_order_relaxed)) continue;
         if (slot.scratch.size() < stereo) continue;
         /* render() left the channel's block in its scratch, already panned. */
-        const float vol = slot.volume.load(std::memory_order_relaxed);
+        const float vol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
         for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
     }
@@ -626,7 +636,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             }
         }
 
-        const float chVol = slot.volume.load(std::memory_order_relaxed);
+        const float chVol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
         for (uint8_t o = 0; o < numOut; ++o) {
             if (!slot.routeEnabled[o].load(std::memory_order_relaxed)) continue;

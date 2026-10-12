@@ -146,6 +146,13 @@ public:
     /// centred channel sounds exactly as it did before pan existed.
     void  setChannelPan   (ChannelId ch, float pan);
     float getChannelPan   (ChannelId ch) const;
+    /// A second gain on the channel, beside its fader, applied wherever the
+    /// fader is (the buses and the tap) and never saved with the desk: what
+    /// another part of the instrument puts on it for a while -- an Arrange
+    /// seq track's fader on the engine its notes play through, while the
+    /// song plays. 1 is none.
+    void  setChannelTrim  (ChannelId ch, float gain);
+    float getChannelTrim  (ChannelId ch) const;
     bool  isAnySoloed     () const;
 
     // ── Output bus control ─────────────────────────────────────────────────
@@ -279,6 +286,7 @@ private:
 
         std::atomic<bool>  active{false};
         std::atomic<float> volume{1.0f};
+        std::atomic<float> trim{1.0f};
         std::atomic<bool>  muted{false};
         std::atomic<bool>  soloed{false};
         std::atomic<float> pan{0.0f};

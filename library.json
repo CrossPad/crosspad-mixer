@@ -1,6 +1,6 @@
 {
     "name": "crosspad-mixer",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "CrossPad audio mixer/router with VU meters, routing matrix, channel strips",
     "keywords": [
         "crosspad",
