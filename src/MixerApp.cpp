@@ -1477,7 +1477,7 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
          * one stream at a level each. */
         lv_obj_t* parent = s_pages[kOut];
         if (heard > 1) {
-            const int32_t gap = lv_obj_get_style_pad_row(s_pages[kOut], 0);
+            const int32_t gap = lv_obj_get_style_pad_row(s_pages[kOut], LV_PART_MAIN);
             lv_obj_t* group = make_box(s_pages[kOut]);
             lv_obj_set_size(group, LV_PCT(100), LV_SIZE_CONTENT);
             lv_obj_set_flex_flow(group, LV_FLEX_FLOW_ROW);
