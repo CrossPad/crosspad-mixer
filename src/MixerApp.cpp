@@ -4,17 +4,17 @@
  *
  * The categories are tabs along the bottom, one page each:
  *
- *   IN       what comes into the board: the mics, the line-in jack, USB audio
- *            from the host. The mics and the jack carry their input GAIN, and
- *            each input its MONITOR: which of the outputs you hear -- 1/2,
- *            3/4, both or neither (the outputs the engine marks heard; a
- *            recording bus keeps its own send).
+ *   IN       what comes into the board: the mics, the line-in jacks, USB
+ *            audio from the host. The mics and the jacks carry their input
+ *            GAIN, and each input its MONITOR: which of the outputs you hear
+ *            -- 1/2, 3/4, both or neither (the outputs the engine marks heard;
+ *            a recording bus keeps its own send). Where the board has more
+ *            inputs than ADCs, the PAIR on top picks the two it hears; the
+ *            input left out stays on the desk, dimmed, its gain and sends
+ *            kept for when a pair takes it back.
  *   SOURCES  what the board plays: the sampler, the pitched instrument, the
  *            click, the song, the recorder's and slicer's preview.
- *   OUT      the jacks' own volume first -- Out 2 (phones and the speakers
- *            beside them) with the speakers' switch, Out 1 (the line out),
- *            what the status bar's drawer had -- then the mix's masters:
- *            speakers, phones, the USB recording bus.
+ *   OUT      the masters: speakers, phones, the USB recording bus.
  *   ROUTE    the send matrix: which source goes to which output, how loud.
  *   PRESETS  (the list icon) the whole desk saved under a name, loaded back:
  *            STREAM, BEATS, SAMPLING start as a starting point for their
@@ -43,11 +43,9 @@
 
 #include "crosspad/app/AppRegistrar.hpp"
 #include "crosspad/audio/IInputGain.hpp"
+#include "crosspad/audio/IInputPairs.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
-#include "crosspad/settings/CrosspadSettings.hpp"
-#include "crosspad/settings/ISettingsUI.hpp"
-#include "crosspad/stm32/reg_map.h"
-#include "crosspad-gui/platform/IGuiPlatform.h"
+#include "crosspad/audio/IOutputLevels.hpp"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -105,6 +103,11 @@ const Look kLooks[] = {
     {"USB",     "USB in",  0xFFC857, kIn},
     {"Line",    "Line in", 0xFF9552, kIn},
     {"Mic",     "Mic",     0xB48CFF, kIn},
+    /* The names master's platform gives its inputs (input pairs, 0.8.0),
+     * kept beside the ones above: whichever the platform registers is filed. */
+    {"IN1",     "Mic",      0xB48CFF, kIn},
+    {"IN2",     "Line 1/2", 0xFF9552, kIn},
+    {"IN3",     "Line 3/4", 0xFFCF99, kIn},
     {"Sampler", "Sampler", 0xC6FF47, kSources},
     {"Pitched", "Pitched", 0x5AC8FF, kSources},
     {"Click",   "Click",   0xFF7A9A, kSources},
@@ -137,6 +140,9 @@ struct Row {
      * "Line in 3/4" are two rows over one channel and only the one that is
      * selected is live. -1 for every other row. */
     int8_t    src = -1;
+    /* A speaker or a jack the output bus plays through (IOutputLevels index):
+     * its fader and mute are the hardware's, its meter the bus's. -1 else. */
+    int8_t    level = -1;
     Page      page = kSources;
     lv_obj_t* box = nullptr;
     lv_obj_t* name = nullptr;    // the button that opens the channel
@@ -156,6 +162,9 @@ uint8_t   s_sources[kMixerMaxChannels];   // ROUTE's rows: every channel
 int       s_sourceCount = 0;
 lv_obj_t* s_sends[kMixerMaxChannels][kMixerMaxOutputs] = {};
 lv_obj_t* s_sendLabels[kMixerMaxChannels][kMixerMaxOutputs] = {};
+lv_obj_t* s_routeRows[kMixerMaxChannels] = {};
+constexpr int kMaxPairs = 4;
+lv_obj_t* s_pairs[kMaxPairs] = {};       // IN: the input pair, one button each
 
 lv_obj_t* s_root = nullptr;
 lv_obj_t* s_pages[kPages] = {};
@@ -192,19 +201,28 @@ constexpr int kMaxSrcChoices = 4;    // sockets sharing one converter; CrossPad 
 
 #ifdef MIXER_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
-
-/* OUT's first rows: the jacks' volume, each a codec's own output level, and
- * the speakers' switch. Out 2 is codec 0, Out 1 codec 1 -- the jacks are
- * numbered the other way round from the codecs. */
-struct Jack { lv_obj_t* fader = nullptr; lv_obj_t* pct = nullptr; uint8_t codec = 0; };
-Jack      s_jacks[2] = {};
-lv_obj_t* s_spkBtn = nullptr;
-bool      s_jacksDirty = false;      // a level moved since the settings were saved
 lv_group_t* s_prevEncGroup = nullptr;
 lv_group_t* s_detailGroup = nullptr;
 #endif
 
 crosspad::IInputGain* gains() { return crosspad::getPlatformServices().inputGain; }
+crosspad::IInputPairs* input_pairs() { return crosspad::getPlatformServices().inputPairs; }
+crosspad::IOutputLevels* output_levels() { return crosspad::getPlatformServices().outputLevels; }
+
+/// Whether mixer channel @p ch hears anything in the input pair: an input
+/// the pair leaves out is on the desk, silent.
+bool connected(uint8_t ch)
+{
+    auto* p = input_pairs();
+    return !p || p->isConnected(getMixerEngine().getChannelName(ch));
+}
+
+/// A row as bright as its channel is live.
+void dim(lv_obj_t* o, bool off)
+{
+    const lv_opa_t opa = off ? LV_OPA_40 : LV_OPA_COVER;
+    if (o && lv_obj_get_style_opa(o, LV_PART_MAIN) != opa) lv_obj_set_style_opa(o, opa, 0);
+}
 
 /// The input-gain index feeding mixer channel @p ch, or -1.
 int gain_input_of(uint8_t ch)
@@ -395,6 +413,14 @@ Row& row_of(lv_event_t* e) { return s_rows[(int)(intptr_t)lv_event_get_user_data
 void fader_cb(lv_event_t* e)
 {
     Row& r = row_of(e);
+    if (r.level >= 0) {
+        const int32_t v = lv_slider_get_value(r.fader);
+        output_levels()->setLevel(r.level, (int)v);
+        char lvl[8];
+        std::snprintf(lvl, sizeof(lvl), "%d", (int)v);
+        set_text(r.db, lvl);
+        return;
+    }
     const float g = fader_to_gain(lv_slider_get_value(r.fader));
     auto& m = getMixerEngine();
     if (r.output) m.setOutputVolume(r.id, g);
@@ -407,6 +433,11 @@ void fader_cb(lv_event_t* e)
 void mute_cb(lv_event_t* e)
 {
     Row& r = row_of(e);
+    if (r.level >= 0) {
+        crosspad::IOutputLevels* ol = output_levels();
+        ol->setMuted(r.level, !ol->muted(r.level));
+        return;
+    }
     auto& m = getMixerEngine();
     if (r.output) m.setOutputMute(r.id, !m.isOutputMuted(r.id));
     else          m.setChannelMute(r.id, !m.isChannelMuted(r.id));
@@ -802,17 +833,15 @@ void rebuild_group()
     if (!s_encGroup) return;
     lv_obj_t* focused = lv_group_get_focused(s_encGroup);
     lv_group_remove_all_objs(s_encGroup);
+    if (s_page == kIn) {
+        for (auto* b : s_pairs) add_to_group(b);
+    }
     if (s_page == kRoute) {
         for (int row = 0; row < s_sourceCount; ++row)
             for (int o = 0; o < kMixerMaxOutputs; ++o) add_to_group(s_sends[row][o]);
     } else if (s_page == kPresets) {
         add_presets_to_group();
     } else {
-        if (s_page == kOut) {
-            add_to_group(s_jacks[0].fader);
-            add_to_group(s_spkBtn);
-            add_to_group(s_jacks[1].fader);
-        }
         for (int i = 0; i < s_rowCount; ++i) {
             const Row& r = s_rows[i];
             if (r.page != s_page) continue;
@@ -1051,8 +1080,14 @@ void tick_row(Row& r, bool anySolo)
     auto& m = getMixerEngine();
     float l = 0.0f, rr = 0.0f, gain = 0.0f;
     bool muted = false;
+    int level = -1;              // a speaker's or a jack's, 0..100
     char buf[24];
-    if (r.output) {
+    if (r.level >= 0) {
+        crosspad::IOutputLevels* ol = output_levels();
+        level = ol->level(r.level);
+        muted = ol->muted(r.level);
+        if (!muted) m.getOutputLevel(r.id, l, rr);   // the bus at unity: what it plays
+    } else if (r.output) {
         m.getOutputLevel(r.id, l, rr);        // already post-master
         gain = m.getOutputVolume(r.id);
         muted = m.isOutputMuted(r.id);
@@ -1085,15 +1120,19 @@ void tick_row(Row& r, bool anySolo)
             if (!lv_color_eq(lv_obj_get_style_text_color(val, LV_PART_MAIN), valInk)) lv_obj_set_style_text_color(val, valInk, 0);
         }
         const int gi = gain_input_of(r.id);
-        if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
-        else         pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
+        const bool live = connected(r.id);
+        if (!live)        std::snprintf(buf, sizeof(buf), "not in pair");
+        else if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
+        else              pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
         set_text(r.sub, buf);
+        dim(r.box, !live);
     }
     paint(r.mute, muted, kMute);
     if (!held(r.fader)) {
-        const int32_t v = gain_to_fader(gain);
+        const int32_t v = level >= 0 ? level : gain_to_fader(gain);
         if (lv_slider_get_value(r.fader) != v) lv_slider_set_value(r.fader, v, LV_ANIM_OFF);
-        db_text(buf, sizeof(buf), gain);
+        if (level >= 0) std::snprintf(buf, sizeof(buf), "%d", level);
+        else            db_text(buf, sizeof(buf), gain);
         set_text(r.db, buf);
     }
     /* Fast up, slow down, the way a meter is read. */
@@ -1119,82 +1158,19 @@ void send_label(int row, int o)
     set_text(l, buf);
 }
 
-// ── the jacks' volume ──────────────────────────────────────────────────────
-//
-// The codecs' own output level, 0..100 -- the knob behind each jack, before
-// anything the mix does. It used to be the status bar's drawer (Out 1, Out 2,
-// Speaker); with the transport bar in its place nothing but Settings reached
-// it, and a board left at Out 2 = 35 and Out 1 = 0 stayed that quiet. Same
-// fields as Settings -> Audio and the drawer (masterFX.outVolumeCodec, by
-// codec), applied at once, saved when the turn is over and on close. The
-// speakers have no level of their own -- they hang off Out 2's codec -- only
-// the amp's switch, which Stm32Manager's gate reads from the settings.
-
-uint8_t* jack_level(uint8_t codec)
-{
-    auto* s = crosspad::CrosspadSettings::getInstance();
-    return s ? &s->masterFX.outVolumeCodec[codec][0] : nullptr;
-}
-
-void save_jacks()
-{
-    if (!s_jacksDirty) return;
-    s_jacksDirty = false;
-    if (auto* ui = crosspad::getSettingsUI()) ui->saveSettings();
-}
-
-void jack_cb(lv_event_t* e)
-{
-    const Jack& j = s_jacks[(int)(intptr_t)lv_event_get_user_data(e)];
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) { save_jacks(); return; }
-    uint8_t* v = jack_level(j.codec);
-    if (!v || !j.fader) return;
-    *v = (uint8_t)lv_slider_get_value(j.fader);
-    auto& plat = crosspad_gui::getGuiPlatform();
-    if (j.codec == 0) plat.setSpeakerVolume(*v);
-    else              plat.setHeadphoneVolume(*v);
-    s_jacksDirty = true;
-}
-
-/// The speakers' amp: off at once, on at the gate's next look -- as Settings.
-void speakers_cb(lv_event_t*)
-{
-    auto* s = crosspad::CrosspadSettings::getInstance();
-    if (!s) return;
-    s->masterFX.speakersEnabled = !s->masterFX.speakersEnabled;
-    s->stm.audioEn = s->masterFX.speakersEnabled ? 1 : 0;
-    auto& plat = crosspad_gui::getGuiPlatform();
-    if (!s->masterFX.speakersEnabled) plat.writeStmConfig8(REG_CTL_AUDIO_EN, 0);
-    else                              plat.setSpeakerVolume(s->masterFX.outVolumeCodec[0][0]);
-    s_jacksDirty = true;
-    save_jacks();
-}
-
-/// From the settings, unless a finger or the encoder has the fader: Settings
-/// and HIL move the same fields.
-void tick_jacks()
-{
-    for (const Jack& j : s_jacks) {
-        const uint8_t* v = jack_level(j.codec);
-        if (!j.fader || !v) continue;
-        if (!held(j.fader) && lv_slider_get_value(j.fader) != *v) lv_slider_set_value(j.fader, *v, LV_ANIM_OFF);
-        char buf[8];
-        std::snprintf(buf, sizeof(buf), "%u%%", (unsigned)lv_slider_get_value(j.fader));
-        set_text(j.pct, buf);
-    }
-    auto* s = crosspad::CrosspadSettings::getInstance();
-    if (s_spkBtn && s) paint(s_spkBtn, s->masterFX.speakersEnabled, kAccent);
-}
-
 void tick_cb(lv_timer_t*)
 {
     auto& m = getMixerEngine();
     const bool anySolo = m.isAnySoloed();
-    if (s_page == kOut) tick_jacks();
     if (s_page != kRoute) {
         for (int i = 0; i < s_rowCount; ++i) if (s_rows[i].page == s_page) tick_row(s_rows[i], anySolo);
+        if (s_page == kIn && input_pairs()) {
+            const int cur = input_pairs()->pair();
+            for (int i = 0; i < kMaxPairs; ++i) paint(s_pairs[i], i == cur, kAccent);
+        }
     } else {
         for (int row = 0; row < s_sourceCount; ++row) {
+            dim(s_routeRows[row], !connected(s_sources[row]));
             for (int o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
                 lv_obj_t* sl = s_sends[row][o];
                 if (!sl || held(sl)) continue;
@@ -1210,7 +1186,8 @@ void tick_cb(lv_timer_t*)
 
 // ── building ───────────────────────────────────────────────────────────────
 
-void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int8_t src = -1)
+void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int8_t src = -1,
+               int8_t level = -1)
 {
     auto& m = getMixerEngine();
     Row& r = s_rows[idx];
@@ -1219,10 +1196,12 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int
     r.id = id;
     r.page = where;
     r.src = src;
+    r.level = level;
 
     const Look* look = output ? nullptr : look_for(m.getChannelName(id));
     const char* label = output ? m.getOutputName(id) : (look ? look->label : m.getChannelName(id));
     if (src >= 0) label = gains() ? gains()->sourceName(gain_input_of(id), src) : "Line";
+    if (level >= 0) label = output_levels()->name(level);
     const lv_color_t color = output ? kText : (look ? lv_color_hex(look->color) : kText);
 
     r.box = make_box(page);
@@ -1262,7 +1241,7 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int
     r.sub = lv_label_create(r.name);
     lv_obj_set_style_text_font(r.sub, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(r.sub, kDim, 0);
-    lv_label_set_text(r.sub, output ? output_role(m.getOutputName(id)) : "");
+    lv_label_set_text(r.sub, level >= 0 ? "" : output ? output_role(m.getOutputName(id)) : "");
 
     /* The fader, long, with the post-fader meter under it. */
     lv_obj_t* lane = make_box(r.box);
@@ -1272,7 +1251,8 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int
     lv_obj_set_flex_flow(lane, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(lane, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(lane, 5, 0);
-    r.fader = make_slider(lane, 0, kFaderMax, output ? kDim : color, fader_cb, (void*)(intptr_t)idx);
+    r.fader = make_slider(lane, 0, level >= 0 ? 100 : kFaderMax, output ? kDim : color, fader_cb,
+                          (void*)(intptr_t)idx);
     lv_obj_set_width(r.fader, LV_PCT(100));
     r.meter = lv_bar_create(lane);
     lv_obj_set_size(r.meter, LV_PCT(100), 3);
@@ -1316,70 +1296,6 @@ void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int
         lv_obj_add_state(r.fader, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(r.fader, kDim, (lv_style_selector_t)LV_PART_KNOB | LV_STATE_DISABLED);
         set_text(r.sub, "Settings");
-    }
-}
-
-/// One jack's row on OUT: its name and what it feeds, the codec's level
-/// 0..100 and the %, and on Out 2 the speakers' switch.
-void build_jack(lv_obj_t* page, int idx, uint8_t codec, const char* name, const char* role)
-{
-    Jack& j = s_jacks[idx];
-    j = Jack{};
-    j.codec = codec;
-
-    lv_obj_t* box = make_box(page);
-    lv_obj_set_size(box, LV_PCT(100), kRowH);
-    lv_obj_set_style_bg_color(box, kRowBg, 0);
-    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(box, 6, 0);
-    lv_obj_set_style_border_width(box, 4, 0);
-    lv_obj_set_style_border_side(box, LV_BORDER_SIDE_LEFT, 0);
-    lv_obj_set_style_border_color(box, kAccent, 0);
-    lv_obj_set_style_pad_hor(box, 4, 0);
-    lv_obj_set_style_pad_column(box, 4, 0);
-    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t* names = make_box(box);
-    lv_obj_set_size(names, 62, kRowH - 2);
-    lv_obj_set_flex_flow(names, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(names, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_t* nl = lv_label_create(names);
-    lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(nl, kAccent, 0);
-    lv_label_set_text(nl, name);
-    lv_obj_t* sub = lv_label_create(names);
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(sub, kDim, 0);
-    lv_label_set_long_mode(sub, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(sub, 62);
-    lv_label_set_text(sub, role);
-
-    lv_obj_t* lane = make_box(box);
-    lv_obj_set_height(lane, kRowH - 4);
-    lv_obj_set_flex_grow(lane, 1);
-    lv_obj_set_style_pad_hor(lane, 10, 0);
-    lv_obj_set_flex_flow(lane, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(lane, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    j.fader = make_slider(lane, 0, 100, kAccent, jack_cb, (void*)(intptr_t)idx);
-    lv_obj_set_width(j.fader, LV_PCT(100));
-    /* Written to the card once the turn is over, not per step. */
-    lv_obj_add_event_cb(j.fader, jack_cb, LV_EVENT_RELEASED, (void*)(intptr_t)idx);
-    lv_obj_add_event_cb(j.fader, jack_cb, LV_EVENT_DEFOCUSED, (void*)(intptr_t)idx);
-
-    j.pct = lv_label_create(box);
-    lv_obj_set_width(j.pct, 36);
-    lv_obj_set_style_text_font(j.pct, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(j.pct, kText, 0);
-    lv_obj_set_style_text_align(j.pct, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(j.pct, "");
-
-    if (codec == 0) {
-        s_spkBtn = make_button(box, 56, 24, LV_SYMBOL_VOLUME_MAX " SPK", speakers_cb, nullptr,
-                               &lv_font_montserrat_10);
-    } else {
-        lv_obj_t* gap = make_box(box);
-        lv_obj_set_size(gap, 56, 1);
     }
 }
 
@@ -1427,6 +1343,7 @@ void build_route(lv_obj_t* page)
         const lv_color_t color = look ? lv_color_hex(look->color) : kText;
 
         lv_obj_t* r = make_box(page);
+        s_routeRows[row] = r;
         lv_obj_set_size(r, LV_PCT(100), kRowH);
         lv_obj_set_style_bg_color(r, kRowBg, 0);
         lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
@@ -1472,6 +1389,23 @@ void build_route(lv_obj_t* page)
     }
 }
 
+/// IN's first row: which inputs the ADCs hear, where the board has to choose.
+void build_pairs(lv_obj_t* page)
+{
+    auto* p = input_pairs();
+    if (!p || p->pairs() < 2) return;
+    lv_obj_t* bar = make_box(page);
+    lv_obj_set_size(bar, LV_PCT(100), 26);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(bar, 4, 0);
+    for (int i = 0; i < p->pairs() && i < kMaxPairs; ++i) {
+        s_pairs[i] = make_button(bar, 10, 26, p->pairName(i), [](lv_event_t* e) {
+            if (auto* ip = input_pairs()) ip->setPair((int)(intptr_t)lv_event_get_user_data(e));
+        }, (void*)(intptr_t)i);
+        lv_obj_set_flex_grow(s_pairs[i], 1);
+    }
+}
+
 } // namespace
 
 lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
@@ -1494,9 +1428,10 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int p = 0; p < kPages; ++p) s_pages[p] = make_page(s_root);
+    build_pairs(s_pages[kIn]);
 
-    /* Channels onto their pages in the order kLooks gives them -- Mic, Line,
-     * USB in; Sampler first among the sources -- not the order they were
+    /* Channels onto their pages in the order kLooks gives them -- Mic, the
+     * lines, USB in; Sampler first among the sources -- not the order they were
      * added in; one the table does not know goes last. Outputs onto OUT. */
     s_rowCount = 0;
     s_sourceCount = 0;
@@ -1526,10 +1461,43 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     for (uint8_t ch = 0; ch < m.maxChannels() && s_rowCount < kMaxRows; ++ch) {
         if (m.isChannelActive(ch) && !look_for(m.getChannelName(ch))) place(ch);
     }
-    build_jack(s_pages[kOut], 0, 0, "Out 2", "phones + spk");
-    build_jack(s_pages[kOut], 1, 1, "Out 1", "line out");
+    /* A bus the hardware gives levels of its own (the engine plays it at
+     * unity) is shown as what it plays through: a row per speaker or jack. */
+    crosspad::IOutputLevels* ol = output_levels();
     for (uint8_t o = 0; o < m.numOutputs() && s_rowCount < kMaxRows; ++o) {
-        build_row(s_pages[kOut], s_rowCount++, true, o, kOut);
+        int heard = 0;
+        for (int i = 0; ol && i < ol->outputs(); ++i) {
+            heard += std::strcmp(ol->mixerOutput(i), m.getOutputName(o)) == 0;
+        }
+        if (!heard || !m.isOutputUnity(o)) {
+            build_row(s_pages[kOut], s_rowCount++, true, o, kOut);
+            continue;
+        }
+        /* Two or more on one bus: held together by a bracket down their left,
+         * one stream at a level each. */
+        lv_obj_t* parent = s_pages[kOut];
+        if (heard > 1) {
+            const int32_t gap = lv_obj_get_style_pad_row(s_pages[kOut], 0);
+            lv_obj_t* group = make_box(s_pages[kOut]);
+            lv_obj_set_size(group, LV_PCT(100), LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(group, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(group, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(group, 3, 0);
+            lv_obj_t* bracket = make_box(group);
+            lv_obj_set_size(bracket, 4, heard * kRowH + (heard - 1) * gap - 8);
+            lv_obj_set_style_bg_color(bracket, kAccent, 0);
+            lv_obj_set_style_bg_opa(bracket, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(bracket, 2, 0);
+            parent = make_box(group);
+            lv_obj_set_height(parent, LV_SIZE_CONTENT);
+            lv_obj_set_flex_grow(parent, 1);
+            lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(parent, gap, 0);
+        }
+        for (int i = 0; i < ol->outputs() && s_rowCount < kMaxRows; ++i) {
+            if (std::strcmp(ol->mixerOutput(i), m.getOutputName(o)) != 0) continue;
+            build_row(parent, s_rowCount++, true, o, kOut, -1, (int8_t)i);
+        }
     }
     build_route(s_pages[kRoute]);
     build_presets(s_pages[kPresets]);
@@ -1580,12 +1548,8 @@ void Mixer_destroy(lv_obj_t* app_obj)
         lv_timer_delete(s_timer);
         s_timer = nullptr;
     }
-    /* The desk as it is left is the desk the next boot starts with -- and the
-     * jacks' levels, if a turn was still unsaved. */
+    /* The desk as it is left is the desk the next boot starts with. */
     getMixerEngine().notifyStateChanged();
-    save_jacks();
-    for (auto& j : s_jacks) j = Jack{};
-    s_spkBtn = nullptr;
 
 #ifdef MIXER_USE_ENCODER
     if (s_detailGroup) { lv_group_delete(s_detailGroup); s_detailGroup = nullptr; }
@@ -1605,6 +1569,8 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& r : s_rows) r = Row{};
     for (auto& row : s_sends) for (auto& c : row) c = nullptr;
     for (auto& row : s_sendLabels) for (auto& c : row) c = nullptr;
+    for (auto& r : s_routeRows) r = nullptr;
+    for (auto& b : s_pairs) b = nullptr;
     for (auto& p : s_pages) p = nullptr;
     for (auto& t : s_tabs) t = nullptr;
     s_rowCount = s_sourceCount = 0;

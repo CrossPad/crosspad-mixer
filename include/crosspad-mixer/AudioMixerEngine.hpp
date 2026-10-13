@@ -174,6 +174,12 @@ public:
     /// a bus that is only recorded (a USB recording bus), never one a player
     /// hears. Not from the render thread.
     void  setOutputLookahead(OutputId out, bool on);
+    /// An output whose level the hardware sets after the DAC (IOutputLevels):
+    /// played at unity and never muted here, whatever a desk, a preset or a
+    /// command asks -- setOutputVolume(), setOutputMute() and a loaded state
+    /// leave it be.
+    void  setOutputUnity (OutputId out, bool unity);
+    bool  isOutputUnity  (OutputId out) const;
 
     // ── Metering (float [0.0, 1.0]) ────────────────────────────────────────
 
@@ -231,11 +237,28 @@ public:
     void loadState(const std::string& path);
 
     /// The same state as a JSON string, for a platform that keeps it
-    /// somewhere other than a file (NVS on the board).
+    /// somewhere other than a file (NVS on the board). Desk format
+    /// kDeskVersion: every channel carries its name, and the name -- not the
+    /// slot -- is what it is loaded back onto.
     std::string stateJson() const;
-    /// Apply a string from stateJson(). False when it does not parse, in
+    /// Apply a string from stateJson(), of this version or an older one.
+    /// Each saved channel goes to the live channel of the same name wherever
+    /// it now sits, so a build that inserts a channel (the native sampler's
+    /// "Sampler2", 2026-10) or drops one loads an older desk onto the right
+    /// channels instead of shifting them. False when it does not parse, in
     /// which case nothing is changed.
     bool applyStateJson(const std::string& json);
+    /// 4: channels matched by name (desks up to 3 were matched by slot, with
+    /// the name only a guard, and lost every channel a new one had moved).
+    /// 5: a desk older than this onto a build with one sample engine gets
+    /// that engine rescued once if it would load silent -- muted, at zero,
+    /// or sent only to outputs nobody hears -- because 4 had already put the
+    /// unused streamer's settings on it and saved them (2026-10-09).
+    static constexpr int kDeskVersion = 5;
+    /// The last applyStateJson() loaded a desk older than kDeskVersion: the
+    /// platform saves it back once, so a rescue is not repeated on every boot
+    /// over what the player does next.
+    bool deskMigrated() const { return deskMigrated_; }
 
     /// Called from non-render threads after the GUI mutates routing/volumes.
     /// Use it to flush state to disk / NVS without putting platform-specific
@@ -304,6 +327,7 @@ private:
         std::atomic<float> volume{1.0f};
         std::atomic<bool>  muted{false};
         std::atomic<bool>  heard{true};
+        std::atomic<bool>  unity{false};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
         std::atomic<float> ceiling{kLimitCeiling};
@@ -323,6 +347,14 @@ private:
     void limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling);
 
     void resetChannelSlot(ChannelSlot& s);
+
+    /// The live slot a saved channel's settings belong to, or -1. Under
+    /// registrationMutex_. See applyStateJson(): by name, the saved id only
+    /// a hint; @p taken holds the slots an earlier entry of the same desk
+    /// already went to.
+    int slotForSaved(int id, const char* name, const bool* taken) const;
+
+    bool deskMigrated_ = false;   ///< see deskMigrated(); under registrationMutex_
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
@@ -348,8 +380,14 @@ private:
     CycFn                 cyc_ = nullptr;
     std::atomic<bool>     prof_{false};
     std::atomic<uint32_t> profPasses_{0};
-    std::atomic<uint64_t> profNode_[kMixerMaxChannels] = {};
-    std::atomic<uint64_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
+    /* Sums in units of 1 << kProfShift cycles, 32-bit: render() adds to them
+     * every pass, and a 64-bit atomic is not lock-free on the S3. A whole
+     * 1.45 ms pass is ~21 800 units at 240 MHz, so a sum wraps only after
+     * ~3 minutes unread; profRead() reads and clears. */
+    static constexpr uint32_t kProfShift = 4;
+    static uint32_t profUnits(uint32_t cycles) { return (cycles + (1u << (kProfShift - 1))) >> kProfShift; }
+    std::atomic<uint32_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint32_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
 
