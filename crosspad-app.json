@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,10 +11,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.55.0",
+    "crosspad-core": ">=1.64.0",
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.14.2: render() through core 1.64's dsp kernels: a send is one madd.s pass (esp-dsp took two, through a scratch), channel and output peaks are branchless, the pan and the output fader one pass, the EQ both channels at once; on the S3 four floats a load where the buffers are on 16 bytes (channel scratch now is). An output the limiter leaves alone takes no clamp pass: its peaks are the limiter's. Same buses bit for bit wherever nothing fuses a multiply-add; on the S3 a send rounds once, not twice.",
     "0.14.1: builds against an LVGL whose lv_part_t is an enum (the PC simulator's): the OUT bracket's gap reads LV_PART_MAIN, not 0.",
     "0.14.0: main's 0.13.0 (OUT a row per speaker and jack at its hardware level, desk v5, input pairs, channels by name) with the engine branch's two since it: every output and the pads tap end in a per-block peak limiter with a hold, not a clamp at full scale -- its ceiling per output from the codec after it (setOutputCeiling), one block of lookahead on a bus that is only recorded (setOutputLookahead), MIX_LVL lim= the deepest gain since the last read -- and setChannelTrim(), a second gain beside a fader on the buses and the tap, never saved with the desk (Arrange puts a seq track's fader there while the song plays). The engine branch's OUT rows for the jacks are gone: the IOutputLevels rows are them.",
     "0.13.0: OUT shows what a bus plays through where the board gives each its own level in the hardware (IOutputLevels, core 1.55.0): on CrossPad Speakers and Out 1/2 (one stream, held together by a bracket) and Out 3/4, each row's fader the codec's analog level after the DAC and its M a mute (the speakers' amp off). Such a bus plays at unity and is never muted in the engine (AudioMixerEngine::setOutputUnity): no fader in front of the DAC, no pass of multiplying, and a desk, a preset or MIX_OUT_VOL leave it there. render() skips the output gain at 1.0 everywhere",

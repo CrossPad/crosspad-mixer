@@ -27,6 +27,7 @@
 #include <vector>
 #include <crosspad/audio/AudioRingBuffer.hpp>
 #include <crosspad/audio/OutputEq.hpp>
+#include <crosspad/dsp/AlignedVector.hpp>
 
 namespace crosspad { class IAudioNode; }
 
@@ -319,7 +320,8 @@ private:
         std::atomic<float> routeVol[kMixerMaxOutputs];
         std::atomic<bool>  routeEnabled[kMixerMaxOutputs];
 
-        std::vector<float> scratch;  // sized in setup()
+        /* Sized in setup(); on 16 bytes for the S3's four-float loads. */
+        crosspad::dsp::AlignedVector<float> scratch;
     };
 
     struct OutputSlot {
@@ -340,9 +342,11 @@ private:
     };
 
     /* The last stage before a bus leaves the mixer, in place of a hard clip
-     * at full scale. Render thread only. */
-    void limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
-               std::atomic<float>& deepest);
+     * at full scale. Render thread only. @p pL / @p pR: each side's peak as
+     * the block came in. False when the block left untouched -- then those
+     * are its peaks going out too. */
+    bool limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
+               std::atomic<float>& deepest, float& pL, float& pR);
     /* limit() one block late, for an output with lookahead on. */
     void limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling);
 
@@ -396,13 +400,6 @@ private:
     mutable std::mutex registrationMutex_;
 
     std::vector<int16_t> tapBuf_;
-
-    // Per-render scratch used by the esp-dsp render path: holds (channel
-    // signal × gain) before being added into the output bus. Sized in
-    // setup() so the audio thread never allocates. On non-IDF builds
-    // (no esp-dsp) this buffer is unused but kept to keep the layout
-    // stable across platforms.
-    std::vector<float> mixScratch_;
 };
 
 /// Global mixer engine accessor (initialized by platform bootstrap).

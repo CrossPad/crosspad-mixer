@@ -7,13 +7,7 @@
 
 #include <crosspad/audio/IAudioNode.hpp>
 #include <crosspad/audio/AudioFormatConvert.hpp>
-
-#if defined(CROSSPAD_USE_ESP_DSP) && __has_include(<esp_dsp.h>)
-  #include <esp_dsp.h>
-  #define CROSSPAD_MIXER_USE_ESP_DSP 1
-#else
-  #define CROSSPAD_MIXER_USE_ESP_DSP 0
-#endif
+#include <crosspad/dsp/AudioKernels.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -74,9 +68,6 @@ CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, u
             slot.node->onPrepare(frameCount, sampleRate);
         }
     }
-    // Render hot path uses this for the (channel × gain) product before
-    // accumulating into the output bus (esp-dsp two-pass MAC). Sized once.
-    if (mixScratch_.size() < stereoSamples) mixScratch_.assign(stereoSamples, 0.0f);
     for (auto& o : outputs_) {
         if (o.lookahead.load(std::memory_order_relaxed)) o.held.assign(stereoSamples, 0.0f);
     }
@@ -396,10 +387,10 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
          * block it did not send (peak 0), unpanned: ±0 either way, the same
          * bits once summed. A block of NaN and zeros is summed as it is. */
         const float vol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
-        const float* src = slot.scratch.data();
-        for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
+        crosspad::dsp::mac(out, slot.scratch.data(), vol, stereo);
     }
-    limit(out, frames, kLimitCeiling, tapLimGain_, tapLimHold_, tapLimMin_);
+    float pL = 0.0f, pR = 0.0f;
+    limit(out, frames, kLimitCeiling, tapLimGain_, tapLimHold_, tapLimMin_, pL, pR);
 }
 
 void AudioMixerEngine::setOutputCeiling(OutputId out, float ceiling) {
@@ -442,21 +433,25 @@ float AudioMixerEngine::takeOutputLimit(OutputId out) {
  * over kLimReleaseS, once kLimHoldS has passed without a block that needed it
  * where it is. A block below the ceiling with the gain back at 1 is only
  * scanned. The clamp in render() stays; nothing should reach it now. */
-void AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
-                             std::atomic<float>& deepest) {
+bool AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
+                             std::atomic<float>& deepest, float& pL, float& pR) {
     const float over = gain > 0.0f ? ceiling / gain : 0.0f;   // what the gain as it stands lets through
-    float peak = 0.0f;
+    /* The peak first, a side each and with no branch per frame; the frame
+     * where the block first goes over only when it does, which is rare. A
+     * frame whose right side is NaN counts its left side here, where the
+     * one-pass scan this replaced skipped the frame. */
+    crosspad::dsp::peakStereo(buf, frames, pL, pR);
+    const float peak = crosspad::dsp::maxOf(pL, pR);
     uint32_t first = frames;
-    for (uint32_t i = 0; i < frames; ++i) {
-        float l = buf[i * 2 + 0]; if (l < 0) l = -l;
-        float r = buf[i * 2 + 1]; if (r < 0) r = -r;
-        const float a = l > r ? l : r;
-        if (a > peak) peak = a;
-        if (first == frames && a > over) first = i;
+    if (peak > over) {
+        for (uint32_t i = 0; i < frames; ++i) {
+            const float a = crosspad::dsp::maxOf(std::fabs(buf[i * 2 + 0]), std::fabs(buf[i * 2 + 1]));
+            if (a > over) { first = i; break; }
+        }
     }
     const float want = peak > ceiling ? ceiling / peak : 1.0f;
     if (want <= gain) hold = limHoldBlocks_;
-    if (gain >= 1.0f && want >= 1.0f) return;
+    if (gain >= 1.0f && want >= 1.0f) return false;
 
     /* Down by the first frame the present gain would let over the ceiling,
      * so none does; held there for the rest of the block. Up, or down to a
@@ -482,6 +477,7 @@ void AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& 
     }
     gain = end;
     if (end < deepest.load(std::memory_order_relaxed)) deepest.store(end, std::memory_order_relaxed);
+    return true;
 }
 
 /* limit() a block late. Coming down within the frames before a peak is a step
@@ -496,12 +492,9 @@ void AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& 
  * then), a ramp down only goes lower, and a ramp up ends where both allow. */
 void AudioMixerEngine::limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling) {
     float* held = o.held.data();
-    const uint32_t stereo = frames * 2;
-    float peak = 0.0f;   // the incoming block's, which leaves next time
-    for (uint32_t i = 0; i < stereo; ++i) {
-        const float a = buf[i] < 0 ? -buf[i] : buf[i];
-        if (a > peak) peak = a;
-    }
+    float inL = 0.0f, inR = 0.0f;
+    crosspad::dsp::peakStereo(buf, frames, inL, inR);
+    const float peak = crosspad::dsp::maxOf(inL, inR);   // the incoming block's, which leaves next time
     /* Only a ceiling lowered since the last block -- a jack turned up -- can
      * leave the starting gain too high for the held block. */
     float g = o.limGain;
@@ -586,12 +579,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (prof) profNode_[ch].fetch_add(profUnits(c1 - c0), std::memory_order_relaxed);
 
         float pL = 0.0f, pR = 0.0f;
-        for (uint32_t i = 0; i < frames; ++i) {
-            float l = slot.scratch[i * 2 + 0]; if (l < 0) l = -l;
-            float r = slot.scratch[i * 2 + 1]; if (r < 0) r = -r;
-            if (l > pL) pL = l;
-            if (r > pR) pR = r;
-        }
+        crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
         if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
@@ -618,13 +606,9 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     //
     // Per (ch, out): out[s] += slot.scratch[s] * gain   (stereo-interleaved)
     //
-    // esp-dsp on Xtensa LX7 has no fused MAC for float, so the optimised
-    // path is two passes over the buffer:
-    //   dsps_mulc_f32: mixScratch_ = src * gain
-    //   dsps_add_f32 : dst         = dst + mixScratch_
-    // For sub-1-KiB stereo buffers (typical: 64..256 frames = 256..1024 B)
-    // both passes stay in L1, so the win comes from the hand-tuned LX7
-    // FPU loops vs the C compiler's auto-vectoriser.
+    // One pass of madd.s (dsp::mac). esp-dsp has no fused multiply-add for
+    // float, and its two passes -- a product into a scratch, then a sum --
+    // read and wrote every sample three times where this does it once.
     const uint32_t cRoute0 = prof ? cyc_() : 0;
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
@@ -650,11 +634,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (pan != 0.0f) {
             const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
             const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
-            float* s = slot.scratch.data();
-            for (uint32_t i = 0; i < frames; ++i) {
-                s[i * 2 + 0] *= gl;
-                s[i * 2 + 1] *= gr;
-            }
+            crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
         }
 
         const float chVol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
@@ -662,14 +642,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         for (uint8_t o = 0; o < numOut; ++o) {
             if (!slot.routeEnabled[o].load(std::memory_order_relaxed)) continue;
             const float gain = chVol * slot.routeVol[o].load(std::memory_order_relaxed);
-            float* dst = outBuses[o];
-#if CROSSPAD_MIXER_USE_ESP_DSP
-            float* tmp = mixScratch_.data();
-            dsps_mulc_f32(src, tmp, stereo, gain, 1, 1);
-            dsps_add_f32 (dst, tmp, dst, stereo, 1, 1, 1);
-#else
-            for (uint32_t s = 0; s < stereo; ++s) dst[s] += src[s] * gain;
-#endif
+            crosspad::dsp::mac(outBuses[o], src, gain, stereo);
         }
     }
 
@@ -678,14 +651,15 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
 
     // 5. Per-output volume + limiter + clamp + meter
     //
-    // dsps_mulc_f32 runs in-place to apply the master output gain, then the
-    // limiter, then a scalar pass handles clamp + peak tracking (esp-dsp has
-    // no clamp/abs-max helper that fits this layout, and the scalar loop
-    // fuses fine).
+    // The limiter scans the block for its peak anyway; when it leaves the
+    // block as it was, that block is under its ceiling, so the clamp has
+    // nothing to do and the limiter's peaks are the meter's.
     for (uint8_t o = 0; o < numOut; ++o) {
         const bool  oMuted = outputs_[o].muted.load(std::memory_order_relaxed);
         const float oVol   = outputs_[o].volume.load(std::memory_order_relaxed);
         float* dst = outBuses[o];
+        float pL = 0.0f, pR = 0.0f;
+        bool settled = false;   // pL/pR are the block's as it leaves, nothing over full scale
 
         if (oMuted) {
             std::memset(dst, 0, stereo * sizeof(float));
@@ -698,18 +672,13 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
                 std::fill(outputs_[o].held.begin(), outputs_[o].held.end(), 0.0f);
                 outputs_[o].heldPeak = 0.0f;
             }
+            settled = true;
         } else {
             /* The correction, then the fader -- none at unity: an output
              * whose level the hardware sets after the DAC stays there, and
              * a pass of multiplying by one is time the render does not have. */
             if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
-            if (oVol != 1.0f) {
-#if CROSSPAD_MIXER_USE_ESP_DSP
-                dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
-#else
-                for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
-#endif
-            }
+            if (oVol != 1.0f) crosspad::dsp::scaleStereo(dst, frames, oVol, oVol);
             OutputSlot& os = outputs_[o];
             const float ceiling = os.ceiling.load(std::memory_order_relaxed);
             /* Held back only by exactly one block: a call of another length
@@ -717,25 +686,13 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             if (os.lookahead.load(std::memory_order_acquire) && os.held.size() == stereo) {
                 limitAhead(os, dst, frames, ceiling);
             } else {
-                limit(dst, frames, ceiling, os.limGain, os.limHold, os.limMin);
+                settled = !limit(dst, frames, ceiling, os.limGain, os.limHold, os.limMin, pL, pR);
             }
         }
 
-        float pL = 0.0f, pR = 0.0f;
-        for (uint32_t i = 0; i < frames; ++i) {
-            float l = dst[i * 2 + 0];
-            float r = dst[i * 2 + 1];
-            if (l >  1.0f) l =  1.0f;
-            if (l < -1.0f) l = -1.0f;
-            if (r >  1.0f) r =  1.0f;
-            if (r < -1.0f) r = -1.0f;
-            dst[i * 2 + 0] = l;
-            dst[i * 2 + 1] = r;
-            float aL = l < 0 ? -l : l;
-            float aR = r < 0 ? -r : r;
-            if (aL > pL) pL = aL;
-            if (aR > pR) pR = aR;
-        }
+        /* SIMD_MODE 0 measures the render as it was, clamp pass and all. */
+        if (!settled || crosspad::dsp::kernelMode() == crosspad::dsp::KernelMode::Reference)
+            crosspad::dsp::clampPeakStereo(dst, frames, pL, pR);
         outputs_[o].peakL.store(pL, std::memory_order_relaxed);
         outputs_[o].peakR.store(pR, std::memory_order_relaxed);
     }
