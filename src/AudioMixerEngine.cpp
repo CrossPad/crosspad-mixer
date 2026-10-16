@@ -539,21 +539,27 @@ CP_COLD void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
 {
     if (!out || cap == 0) return;
     const uint32_t n = profPasses_.exchange(0, std::memory_order_relaxed);
-    const double d = (n ? double(n) : 1.0) * double(cpuMhz > 0 ? cpuMhz : 240.0) /
-                     double(1u << kProfShift);
-    int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%.1f clear_us=%.1f "
-                          "route_us=%.1f out_us=%.1f nodes=",
+    /* Tenths of a microsecond in integers, no double through snprintf: on the
+     * board this runs on a 4 kB task already deep in a verb handler, and
+     * dtoa's frames with an interrupt on top overflowed it. */
+    const uint64_t d = uint64_t(n ? n : 1) * uint64_t(cpuMhz > 0 ? cpuMhz + 0.5f : 240.0f);
+    auto tenths = [d](uint32_t units) {
+        return (unsigned)(((uint64_t(units) << kProfShift) * 10 + d / 2) / d);
+    };
+    const unsigned pk = tenths(profPeak_.exchange(0, std::memory_order_relaxed));
+    const unsigned cl = tenths(profClear_.exchange(0, std::memory_order_relaxed));
+    const unsigned ro = tenths(profRoute_.exchange(0, std::memory_order_relaxed));
+    const unsigned ou = tenths(profOut_.exchange(0, std::memory_order_relaxed));
+    int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%u.%u clear_us=%u.%u "
+                          "route_us=%u.%u out_us=%u.%u nodes=",
                           prof_.load(std::memory_order_relaxed) ? 1 : 0, (unsigned)n,
-                          double(profPeak_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profClear_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profRoute_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profOut_.exchange(0, std::memory_order_relaxed)) / d);
+                          pk / 10, pk % 10, cl / 10, cl % 10, ro / 10, ro % 10, ou / 10, ou % 10);
     /* Only the channels that cost something: sixteen "ch3=0.0" would push the
      * interesting ones off a 192-byte reply. */
     for (uint8_t ch = 0; ch < kMixerMaxChannels && w > 0 && (uint32_t)w + 16 < cap; ++ch) {
-        const double us = double(profNode_[ch].exchange(0, std::memory_order_relaxed)) / d;
-        if (us < 1.0) continue;
-        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%.0f ", (unsigned)ch, us);
+        const unsigned us = (tenths(profNode_[ch].exchange(0, std::memory_order_relaxed)) + 5) / 10;
+        if (us < 1) continue;
+        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%u ", (unsigned)ch, us);
     }
     if (w > 0 && (uint32_t)w + 3 < cap) std::snprintf(out + w, cap - (uint32_t)w, "\r\n");
 }
