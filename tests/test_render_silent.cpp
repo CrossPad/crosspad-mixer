@@ -52,7 +52,10 @@ enum class Side { Both, LeftOnly, RightOnly };
 void fillNoise(std::vector<float>& b, uint32_t seed, Side side = Side::Both) {
     for (size_t i = 0; i < b.size(); ++i) {
         seed = seed * 1664525u + 1013904223u;
-        const float v = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 1.2f;
+        /* ±0.125: eleven channels summed stay under the limiter's ceiling on
+         * every bus and on the tap. What is compared is which channels were
+         * sent, not how the limiter shapes a loud block. */
+        const float v = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 0.25f;
         const bool left = (i % 2) == 0;
         b[i] = (side == Side::Both || (side == Side::LeftOnly) == left) ? v : 0.0f;
     }
@@ -110,9 +113,10 @@ Mix referenceMix(const std::vector<Strip>& strips, const float outVol[kBuses]) {
     }
     for (uint8_t o = 0; o < kBuses; ++o) {
         for (uint32_t i = 0; i < kStereo; ++i) {
-            float v = m.bus[o][i] * outVol[o];
-            if (v >  1.0f) v =  1.0f;
-            if (v < -1.0f) v = -1.0f;
+            const float v = m.bus[o][i] * outVol[o];
+            /* Under the limiter's ceiling the output is the sum as it is;
+             * the limiter itself is test_render_kernels' to check. */
+            REQUIRE(std::fabs(v) < AudioMixerEngine::kLimitCeiling);
             m.bus[o][i] = v;
         }
         m.peakL[o] = meterPeak(m.bus[o], 0);
@@ -254,6 +258,7 @@ TEST_CASE("Mixer render: silent channels leave the buses bit for bit as the full
             const std::vector<float> s = pannedBlock(strips[i]);
             for (uint32_t k = 0; k < kStereo; ++k) wantTap[k] += s[k] * strips[i].vol;
         }
+        for (float v : wantTap) REQUIRE(std::fabs(v) < AudioMixerEngine::kLimitCeiling);
         INFO("block " << blocks << " '" << who << "' tap");
         CHECK(sameBits(tap, wantTap));
     }
