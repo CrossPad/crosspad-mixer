@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.14.3",
+  "version": "0.14.4",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.14.0"
   },
   "changelog": [
+    "0.14.4: the reference pass is gone with core 1.66's kernel switch: an output the limiter leaves alone is never clamped. The render-kernels test holds the output to a digest recorded through the old loops.",
     "0.14.3: MIXPROF formats its microseconds as integers: no double through snprintf on the board's 4 kB main task, where dtoa with an interrupt on top overflowed the stack.",
     "0.14.2: render() through core 1.64's dsp kernels: a send is one madd.s pass (esp-dsp took two, through a scratch), channel and output peaks are branchless, the pan and the output fader one pass, the EQ both channels at once; on the S3 four floats a load where the buffers are on 16 bytes (channel scratch now is). An output the limiter leaves alone takes no clamp pass: its peaks are the limiter's. Same buses bit for bit wherever nothing fuses a multiply-add; on the S3 a send rounds once, not twice.",
     "0.14.1: builds against an LVGL whose lv_part_t is an enum (the PC simulator's): the OUT bracket's gap reads LV_PART_MAIN, not 0.",

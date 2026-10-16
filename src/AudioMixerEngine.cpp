@@ -696,9 +696,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             }
         }
 
-        /* SIMD_MODE 0 measures the render as it was, clamp pass and all. */
-        if (!settled || crosspad::dsp::kernelMode() == crosspad::dsp::KernelMode::Reference)
-            crosspad::dsp::clampPeakStereo(dst, frames, pL, pR);
+        if (!settled) crosspad::dsp::clampPeakStereo(dst, frames, pL, pR);
         outputs_[o].peakL.store(pL, std::memory_order_relaxed);
         outputs_[o].peakR.store(pR, std::memory_order_relaxed);
     }

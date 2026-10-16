@@ -9,9 +9,10 @@
 #include <vector>
 
 /* render() through core's dsp kernels against render() through the loops they
- * replaced (dsp KernelMode::Reference): the same buses, the same meters, the
- * same limiter, block after block -- on the host, where nothing fuses a
- * multiply-add, bit for bit. */
+ * replaced: the same buses, the same meters, the same limiter, block after
+ * block -- on the host, where nothing fuses a multiply-add, bit for bit. Those
+ * loops left core once the board had chosen; what they rendered is kept as
+ * the digest of this script's output, recorded through them (16.10.2026). */
 
 namespace {
 
@@ -48,11 +49,8 @@ struct Run {
     std::vector<float> limits;    // each output's and the tap's deepest limiter gain
 };
 
-Run play(crosspad::dsp::KernelMode mode, bool alignedBuses)
+Run play(bool alignedBuses)
 {
-    const crosspad::dsp::KernelMode was = crosspad::dsp::kernelMode();
-    crosspad::dsp::setKernelMode(mode);
-
     NoiseNode n0(1, 0.9f), n1(2, 0.6f), n2(3, 1.1f), n3(4, 0.3f);
     AudioMixerEngine eng;
     eng.setup(kFrames, 44100, kBuses);
@@ -113,27 +111,41 @@ Run play(crosspad::dsp::KernelMode mode, bool alignedBuses)
         }
         r.limits.push_back(eng.takeOutputLimit(AudioMixerEngine::kTapLimit));
     }
-    crosspad::dsp::setKernelMode(was);
     return r;
 }
 
-bool sameBits(const std::vector<float>& a, const std::vector<float>& b)
+/* FNV-1a over the bits of every sample: what a recorded run is compared by. */
+uint64_t digest(const std::vector<float>& v)
 {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+    uint64_t h = 1469598103934665603ull;
+    for (float f : v) {
+        uint32_t b;
+        std::memcpy(&b, &f, sizeof b);
+        for (int i = 0; i < 4; ++i) {
+            h ^= (b >> (i * 8)) & 0xFFu;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
 }
 
 } // namespace
 
 TEST_CASE("Mixer render: the dsp kernels sound as the loops they replaced", "[mixer][render][kernels]")
 {
-    const Run ref = play(crosspad::dsp::KernelMode::Reference, true);
+    Run ref;
     for (bool aligned : {true, false}) {
         INFO("buses on 16 bytes: " << aligned);
-        const Run fast = play(crosspad::dsp::KernelMode::Portable, aligned);
-        CHECK(sameBits(ref.buses, fast.buses));
-        CHECK(sameBits(ref.taps, fast.taps));
-        CHECK(sameBits(ref.meters, fast.meters));
-        CHECK(sameBits(ref.limits, fast.limits));
+        const Run fast = play(aligned);
+        REQUIRE(fast.buses.size() == 15360);
+        REQUIRE(fast.taps.size() == 5120);
+        REQUIRE(fast.meters.size() == 560);
+        REQUIRE(fast.limits.size() == 160);
+        CHECK(digest(fast.buses) == 0x940e866f98c7286aull);
+        CHECK(digest(fast.taps) == 0x2117eecc9018e6a5ull);
+        CHECK(digest(fast.meters) == 0xccbfd4b672fcf20eull);
+        CHECK(digest(fast.limits) == 0x874d77dbcd13a5f9ull);
+        ref = fast;
     }
 
     /* The script did what it is there for: the limiter acted, and the
