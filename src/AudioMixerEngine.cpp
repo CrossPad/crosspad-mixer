@@ -7,14 +7,9 @@
 
 #include <crosspad/audio/IAudioNode.hpp>
 #include <crosspad/audio/AudioFormatConvert.hpp>
+#include <crosspad/dsp/AudioKernels.hpp>
 
-#if defined(CROSSPAD_USE_ESP_DSP) && __has_include(<esp_dsp.h>)
-  #include <esp_dsp.h>
-  #define CROSSPAD_MIXER_USE_ESP_DSP 1
-#else
-  #define CROSSPAD_MIXER_USE_ESP_DSP 0
-#endif
-
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -41,6 +36,18 @@ AudioMixerEngine::AudioMixerEngine() {
 
 AudioMixerEngine::~AudioMixerEngine() = default;
 
+/* How long the limiter takes to let go: slow enough that a bass note is not
+ * pumped into distortion by its own cycles, fast enough that a loud hit does
+ * not duck the next bar. */
+static constexpr float kLimReleaseS = 0.2f;
+/* How long the gain stays where a peak put it before letting go at all. Per
+ * block, a release between the crests of one loud note and a cut back at the
+ * next crest moves the gain with the waveform -- the limiter turned into a
+ * waveshaper, heard as drive. Modelled block for block (10.10.2026): a 40 Hz
+ * sine 6 dB over the ceiling came out at THD -36 dB, -77 dB with this hold;
+ * 60 Hz + 7 kHz IMD -40 -> -57 dB. Longer than a 20 Hz period. */
+static constexpr float kLimHoldS = 0.05f;
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
@@ -61,9 +68,13 @@ CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, u
             slot.node->onPrepare(frameCount, sampleRate);
         }
     }
-    // Render hot path uses this for the (channel × gain) product before
-    // accumulating into the output bus (esp-dsp two-pass MAC). Sized once.
-    if (mixScratch_.size() < stereoSamples) mixScratch_.assign(stereoSamples, 0.0f);
+    for (auto& o : outputs_) {
+        if (o.lookahead.load(std::memory_order_relaxed)) o.held.assign(stereoSamples, 0.0f);
+    }
+
+    limRelease_ = sampleRate ? 1.0f - std::exp(-(float)frameCount / ((float)sampleRate * kLimReleaseS))
+                             : 1.0f;
+    limHoldBlocks_ = frameCount ? (uint16_t)std::ceil(kLimHoldS * (float)sampleRate / (float)frameCount) : 0;
 }
 
 void AudioMixerEngine::resetChannelSlot(ChannelSlot& s) {
@@ -248,6 +259,16 @@ float AudioMixerEngine::getChannelVolume(ChannelId ch) const {
     return channels_[ch].volume.load(std::memory_order_relaxed);
 }
 
+void AudioMixerEngine::setChannelTrim(ChannelId ch, float gain) {
+    if (ch >= kMixerMaxChannels) return;
+    channels_[ch].trim.store(gain < 0.0f ? 0.0f : gain, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getChannelTrim(ChannelId ch) const {
+    if (ch >= kMixerMaxChannels) return 1.0f;
+    return channels_[ch].trim.load(std::memory_order_relaxed);
+}
+
 void AudioMixerEngine::setChannelMute(ChannelId ch, bool muted) {
     if (ch >= kMixerMaxChannels) return;
     channels_[ch].muted.store(muted, std::memory_order_relaxed);
@@ -347,7 +368,7 @@ void AudioMixerEngine::getOutputLevel(OutputId out, int16_t& left, int16_t& righ
 
 // ── Render (single audio thread) ──────────────────────────────────────────
 
-void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) const {
+void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames) {
     const uint32_t stereo = frames * 2;
     std::memset(out, 0, stereo * sizeof(float));
     bool anySoloed = false;
@@ -365,10 +386,142 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
         /* render() left the channel's block in its scratch, panned -- or, for a
          * block it did not send (peak 0), unpanned: ±0 either way, the same
          * bits once summed. A block of NaN and zeros is summed as it is. */
-        const float vol = slot.volume.load(std::memory_order_relaxed);
-        const float* src = slot.scratch.data();
-        for (uint32_t s = 0; s < stereo; ++s) out[s] += src[s] * vol;
+        const float vol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
+        crosspad::dsp::mac(out, slot.scratch.data(), vol, stereo);
     }
+    float pL = 0.0f, pR = 0.0f;
+    limit(out, frames, kLimitCeiling, tapLimGain_, tapLimHold_, tapLimMin_, pL, pR);
+}
+
+void AudioMixerEngine::setOutputCeiling(OutputId out, float ceiling) {
+    if (out >= kMixerMaxOutputs) return;
+    if (ceiling > kLimitCeiling) ceiling = kLimitCeiling;
+    if (ceiling < 0.01f) ceiling = 0.01f;
+    outputs_[out].ceiling.store(ceiling, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getOutputCeiling(OutputId out) const {
+    if (out >= kMixerMaxOutputs) return kLimitCeiling;
+    return outputs_[out].ceiling.load(std::memory_order_relaxed);
+}
+
+void AudioMixerEngine::setOutputLookahead(OutputId out, bool on) {
+    if (out >= kMixerMaxOutputs) return;
+    OutputSlot& o = outputs_[out];
+    /* Sized before the flag is published, and only the first time: the
+     * render reads `held` only behind an acquire of `lookahead`. */
+    if (on && o.held.empty()) o.held.assign((size_t)frameCount_ * 2, 0.0f);
+    o.lookahead.store(on, std::memory_order_release);
+}
+
+float AudioMixerEngine::takeOutputLimit(OutputId out) {
+    if (out == kTapLimit) return tapLimMin_.exchange(1.0f, std::memory_order_relaxed);
+    if (out >= numOutputs_) return 1.0f;
+    return outputs_[out].limMin.exchange(1.0f, std::memory_order_relaxed);
+}
+
+/* A peak limiter in place of the hard clip at full scale.
+ *
+ * Nothing in the mix keeps headroom of its own: the sample engines sum their
+ * voices at unity and a fader goes to +6 dB. Sixteen pads at once put 1.66 on
+ * the Sampler2 channel, so with the output fader near 0 dB the clamp in
+ * render() cut the tops off -- heard as distortion -- and the pads tap, with
+ * no fader at all, wrote it into every bounce and take (09.10.2026).
+ *
+ * Per block, which the render has whole before any of it leaves: the gain
+ * comes down to what the block's peak allows and goes back towards unity
+ * over kLimReleaseS, once kLimHoldS has passed without a block that needed it
+ * where it is. A block below the ceiling with the gain back at 1 is only
+ * scanned. The clamp in render() stays; nothing should reach it now. */
+bool AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& gain, uint16_t& hold,
+                             std::atomic<float>& deepest, float& pL, float& pR) {
+    const float over = gain > 0.0f ? ceiling / gain : 0.0f;   // what the gain as it stands lets through
+    /* The peak first, a side each and with no branch per frame; the frame
+     * where the block first goes over only when it does, which is rare. A
+     * frame whose right side is NaN counts its left side here, where the
+     * one-pass scan this replaced skipped the frame. */
+    crosspad::dsp::peakStereo(buf, frames, pL, pR);
+    const float peak = crosspad::dsp::maxOf(pL, pR);
+    uint32_t first = frames;
+    if (peak > over) {
+        for (uint32_t i = 0; i < frames; ++i) {
+            const float a = crosspad::dsp::maxOf(std::fabs(buf[i * 2 + 0]), std::fabs(buf[i * 2 + 1]));
+            if (a > over) { first = i; break; }
+        }
+    }
+    const float want = peak > ceiling ? ceiling / peak : 1.0f;
+    if (want <= gain) hold = limHoldBlocks_;
+    if (gain >= 1.0f && want >= 1.0f) return false;
+
+    /* Down by the first frame the present gain would let over the ceiling,
+     * so none does; held there for the rest of the block. Up, or down to a
+     * level nothing in the block exceeds, across the whole block. */
+    float end = gain;
+    if (hold) {
+        --hold;
+    } else {
+        end = gain + (1.0f - gain) * limRelease_;
+        if (end > 0.999f) end = 1.0f;
+    }
+    uint32_t span = frames;
+    if (want < end) {
+        end = want;
+        if (want < gain) span = first + 1;
+    }
+    const float step = (end - gain) / (float)span;
+    float g = gain;
+    for (uint32_t i = 0; i < frames; ++i) {
+        if (i < span) g += step;
+        buf[i * 2 + 0] *= g;
+        buf[i * 2 + 1] *= g;
+    }
+    gain = end;
+    if (end < deepest.load(std::memory_order_relaxed)) deepest.store(end, std::memory_order_relaxed);
+    return true;
+}
+
+/* limit() a block late. Coming down within the frames before a peak is a step
+ * when the peak is near the start of a block -- and on the USB recording bus,
+ * with no fader in front of it, a chord in 16 levels of pitch put one there on
+ * every hit: lim 0.367, clicks in the take and none on the jacks (10.10.2026).
+ *
+ * Here what leaves is the block held back, and the one coming in is known, so
+ * the gain reaches what both need by the end of the outgoing block, in one
+ * ramp across it. Nothing gets over the ceiling: the gain this block starts
+ * at was already low enough for it a block ago (it was the incoming one
+ * then), a ramp down only goes lower, and a ramp up ends where both allow. */
+void AudioMixerEngine::limitAhead(OutputSlot& o, float* buf, uint32_t frames, float ceiling) {
+    float* held = o.held.data();
+    float inL = 0.0f, inR = 0.0f;
+    crosspad::dsp::peakStereo(buf, frames, inL, inR);
+    const float peak = crosspad::dsp::maxOf(inL, inR);   // the incoming block's, which leaves next time
+    /* Only a ceiling lowered since the last block -- a jack turned up -- can
+     * leave the starting gain too high for the held block. */
+    float g = o.limGain;
+    if (o.heldPeak * g > ceiling) g = ceiling / o.heldPeak;
+    const float worst = peak > o.heldPeak ? peak : o.heldPeak;
+    if (worst * g >= ceiling) o.limHold = limHoldBlocks_;
+    float end = g;
+    if (o.limHold) {
+        --o.limHold;
+    } else {
+        end = g + (1.0f - g) * limRelease_;
+        if (end > 0.999f) end = 1.0f;
+    }
+    if (worst * end > ceiling) end = ceiling / worst;
+
+    const float step = (end - g) / (float)frames;
+    for (uint32_t i = 0; i < frames; ++i) {
+        g += step;
+        const float l = buf[i * 2 + 0], r = buf[i * 2 + 1];
+        buf[i * 2 + 0] = held[i * 2 + 0] * g;
+        buf[i * 2 + 1] = held[i * 2 + 1] * g;
+        held[i * 2 + 0] = l;
+        held[i * 2 + 1] = r;
+    }
+    o.heldPeak = peak;
+    o.limGain = end;
+    if (end < o.limMin.load(std::memory_order_relaxed)) o.limMin.store(end, std::memory_order_relaxed);
 }
 
 CP_COLD void AudioMixerEngine::profEnable(bool on)
@@ -386,21 +539,27 @@ CP_COLD void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
 {
     if (!out || cap == 0) return;
     const uint32_t n = profPasses_.exchange(0, std::memory_order_relaxed);
-    const double d = (n ? double(n) : 1.0) * double(cpuMhz > 0 ? cpuMhz : 240.0) /
-                     double(1u << kProfShift);
-    int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%.1f clear_us=%.1f "
-                          "route_us=%.1f out_us=%.1f nodes=",
+    /* Tenths of a microsecond in integers, no double through snprintf: on the
+     * board this runs on a 4 kB task already deep in a verb handler, and
+     * dtoa's frames with an interrupt on top overflowed it. */
+    const uint64_t d = uint64_t(n ? n : 1) * uint64_t(cpuMhz > 0 ? cpuMhz + 0.5f : 240.0f);
+    auto tenths = [d](uint32_t units) {
+        return (unsigned)(((uint64_t(units) << kProfShift) * 10 + d / 2) / d);
+    };
+    const unsigned pk = tenths(profPeak_.exchange(0, std::memory_order_relaxed));
+    const unsigned cl = tenths(profClear_.exchange(0, std::memory_order_relaxed));
+    const unsigned ro = tenths(profRoute_.exchange(0, std::memory_order_relaxed));
+    const unsigned ou = tenths(profOut_.exchange(0, std::memory_order_relaxed));
+    int w = std::snprintf(out, cap, "MIXPROF: on=%d passes=%u peak_us=%u.%u clear_us=%u.%u "
+                          "route_us=%u.%u out_us=%u.%u nodes=",
                           prof_.load(std::memory_order_relaxed) ? 1 : 0, (unsigned)n,
-                          double(profPeak_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profClear_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profRoute_.exchange(0, std::memory_order_relaxed)) / d,
-                          double(profOut_.exchange(0, std::memory_order_relaxed)) / d);
+                          pk / 10, pk % 10, cl / 10, cl % 10, ro / 10, ro % 10, ou / 10, ou % 10);
     /* Only the channels that cost something: sixteen "ch3=0.0" would push the
      * interesting ones off a 192-byte reply. */
     for (uint8_t ch = 0; ch < kMixerMaxChannels && w > 0 && (uint32_t)w + 16 < cap; ++ch) {
-        const double us = double(profNode_[ch].exchange(0, std::memory_order_relaxed)) / d;
-        if (us < 1.0) continue;
-        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%.0f ", (unsigned)ch, us);
+        const unsigned us = (tenths(profNode_[ch].exchange(0, std::memory_order_relaxed)) + 5) / 10;
+        if (us < 1) continue;
+        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%u ", (unsigned)ch, us);
     }
     if (w > 0 && (uint32_t)w + 3 < cap) std::snprintf(out + w, cap - (uint32_t)w, "\r\n");
 }
@@ -426,12 +585,7 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (prof) profNode_[ch].fetch_add(profUnits(c1 - c0), std::memory_order_relaxed);
 
         float pL = 0.0f, pR = 0.0f;
-        for (uint32_t i = 0; i < frames; ++i) {
-            float l = slot.scratch[i * 2 + 0]; if (l < 0) l = -l;
-            float r = slot.scratch[i * 2 + 1]; if (r < 0) r = -r;
-            if (l > pL) pL = l;
-            if (r > pR) pR = r;
-        }
+        crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
         if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
@@ -458,13 +612,9 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     //
     // Per (ch, out): out[s] += slot.scratch[s] * gain   (stereo-interleaved)
     //
-    // esp-dsp on Xtensa LX7 has no fused MAC for float, so the optimised
-    // path is two passes over the buffer:
-    //   dsps_mulc_f32: mixScratch_ = src * gain
-    //   dsps_add_f32 : dst         = dst + mixScratch_
-    // For sub-1-KiB stereo buffers (typical: 64..256 frames = 256..1024 B)
-    // both passes stay in L1, so the win comes from the hand-tuned LX7
-    // FPU loops vs the C compiler's auto-vectoriser.
+    // One pass of madd.s (dsp::mac). esp-dsp has no fused multiply-add for
+    // float, and its two passes -- a product into a scratch, then a sum --
+    // read and wrote every sample three times where this does it once.
     const uint32_t cRoute0 = prof ? cyc_() : 0;
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
@@ -490,76 +640,63 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (pan != 0.0f) {
             const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
             const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
-            float* s = slot.scratch.data();
-            for (uint32_t i = 0; i < frames; ++i) {
-                s[i * 2 + 0] *= gl;
-                s[i * 2 + 1] *= gr;
-            }
+            crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
         }
 
-        const float chVol = slot.volume.load(std::memory_order_relaxed);
+        const float chVol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
         for (uint8_t o = 0; o < numOut; ++o) {
             if (!slot.routeEnabled[o].load(std::memory_order_relaxed)) continue;
             const float gain = chVol * slot.routeVol[o].load(std::memory_order_relaxed);
-            float* dst = outBuses[o];
-#if CROSSPAD_MIXER_USE_ESP_DSP
-            float* tmp = mixScratch_.data();
-            dsps_mulc_f32(src, tmp, stereo, gain, 1, 1);
-            dsps_add_f32 (dst, tmp, dst, stereo, 1, 1, 1);
-#else
-            for (uint32_t s = 0; s < stereo; ++s) dst[s] += src[s] * gain;
-#endif
+            crosspad::dsp::mac(outBuses[o], src, gain, stereo);
         }
     }
 
     const uint32_t cRoute1 = prof ? cyc_() : 0;
     if (prof) profRoute_.fetch_add(profUnits(cRoute1 - cRoute0), std::memory_order_relaxed);
 
-    // 5. Per-output volume + clamp + meter
+    // 5. Per-output volume + limiter + clamp + meter
     //
-    // dsps_mulc_f32 runs in-place to apply the master output gain, then a
-    // scalar pass handles clamp + peak tracking (esp-dsp has no clamp/abs-
-    // max helper that fits this layout, and the scalar loop fuses fine).
+    // The limiter scans the block for its peak anyway; when it leaves the
+    // block as it was, that block is under its ceiling, so the clamp has
+    // nothing to do and the limiter's peaks are the meter's.
     for (uint8_t o = 0; o < numOut; ++o) {
         const bool  oMuted = outputs_[o].muted.load(std::memory_order_relaxed);
         const float oVol   = outputs_[o].volume.load(std::memory_order_relaxed);
         float* dst = outBuses[o];
+        float pL = 0.0f, pR = 0.0f;
+        bool settled = false;   // pL/pR are the block's as it leaves, nothing over full scale
 
         if (oMuted) {
             std::memset(dst, 0, stereo * sizeof(float));
             /* The sections forget where they were: coming back from mute
              * should not play out what was in them a minute ago. */
             if (o < kMixerEqOutputs) outputEq_[o].reset();
+            outputs_[o].limGain = 1.0f;
+            outputs_[o].limHold = 0;
+            if (outputs_[o].lookahead.load(std::memory_order_acquire)) {
+                std::fill(outputs_[o].held.begin(), outputs_[o].held.end(), 0.0f);
+                outputs_[o].heldPeak = 0.0f;
+            }
+            settled = true;
         } else {
             /* The correction, then the fader -- none at unity: an output
              * whose level the hardware sets after the DAC stays there, and
              * a pass of multiplying by one is time the render does not have. */
             if (o < kMixerEqOutputs) outputEq_[o].process(dst, frames);
-            if (oVol != 1.0f) {
-#if CROSSPAD_MIXER_USE_ESP_DSP
-                dsps_mulc_f32(dst, dst, stereo, oVol, 1, 1);
-#else
-                for (uint32_t i = 0; i < stereo; ++i) dst[i] *= oVol;
-#endif
+            if (oVol != 1.0f) crosspad::dsp::scaleStereo(dst, frames, oVol, oVol);
+            OutputSlot& os = outputs_[o];
+            const float ceiling = os.ceiling.load(std::memory_order_relaxed);
+            /* Held back only by exactly one block: a call of another length
+             * would hand out frames that are not the ones before. */
+            if (os.lookahead.load(std::memory_order_acquire) && os.held.size() == stereo) {
+                limitAhead(os, dst, frames, ceiling);
+            } else {
+                settled = !limit(dst, frames, ceiling, os.limGain, os.limHold, os.limMin, pL, pR);
             }
         }
 
-        float pL = 0.0f, pR = 0.0f;
-        for (uint32_t i = 0; i < frames; ++i) {
-            float l = dst[i * 2 + 0];
-            float r = dst[i * 2 + 1];
-            if (l >  1.0f) l =  1.0f;
-            if (l < -1.0f) l = -1.0f;
-            if (r >  1.0f) r =  1.0f;
-            if (r < -1.0f) r = -1.0f;
-            dst[i * 2 + 0] = l;
-            dst[i * 2 + 1] = r;
-            float aL = l < 0 ? -l : l;
-            float aR = r < 0 ? -r : r;
-            if (aL > pL) pL = aL;
-            if (aR > pR) pR = aR;
-        }
+        if (!settled) crosspad::dsp::clampPeakStereo(dst, frames, pL, pR);
         outputs_[o].peakL.store(pL, std::memory_order_relaxed);
         outputs_[o].peakR.store(pR, std::memory_order_relaxed);
     }
