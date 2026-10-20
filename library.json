@@ -1,6 +1,6 @@
 {
     "name": "crosspad-mixer",
-    "version": "0.14.4",
+    "version": "0.15.0",
     "license": "GPL-3.0-or-later",
     "description": "CrossPad audio mixer/router with VU meters, routing matrix, channel strips",
     "keywords": [
@@ -16,8 +16,8 @@
         "espressif32"
     ],
     "dependencies": {
-        "crosspad-core": "*",
-        "crosspad-gui": "*"
+        "crosspad-core": ">=1.70.0,<3.0.0",
+        "crosspad-gui": ">=1.28.0,<3.0.0"
     },
     "build": {
         "srcDir": "src",

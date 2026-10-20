@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.14.4",
+  "version": "0.15.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,10 +11,12 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.64.0",
-    "crosspad-gui": ">=1.14.0"
+    "crosspad-core": ">=1.70.0,<3.0.0",
+    "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.15.0: the Mixer in the UX 2000 design, sized for a finger: five tabs -- IN (inputs: GAIN or PAN, MON to every output heard, a row per socket, PAIR where the board has more inputs than ADCs), SOURCES (LEVEL or PAN, M, S), OUT (the masters and every output with a level of its own: LEVEL, M, LIM lit while the limiter works), ROUTE (a chip per source and output, CLEAR, RESET) and PRESETS (the desk saved and loaded by name, UNDO) -- rows with a 152 px zone a finger drags and two keys, the rest of a channel (sends, monitor, pan, an output's tone) behind its name; the engine is the only state, so anything else that moves the mix shows up here.",
+    "0.14.5: defines CROSSPAD_USE_ESP_DSP for itself on esp32s3, which core 2.0 no longer exports; builds on core 1.70+/gui 1.28+ and on core/gui 2.x (>=1.70.0,<3.0.0 and >=1.28.0,<3.0.0) for the merge window; a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",
     "0.14.4: the reference pass is gone with core 1.66's kernel switch: an output the limiter leaves alone is never clamped. The render-kernels test holds the output to a digest recorded through the old loops.",
     "0.14.3: MIXPROF formats its microseconds as integers: no double through snprintf on the board's 4 kB main task, where dtoa with an interrupt on top overflowed the stack.",
     "0.14.2: render() through core 1.64's dsp kernels: a send is one madd.s pass (esp-dsp took two, through a scratch), channel and output peaks are branchless, the pan and the output fader one pass, the EQ both channels at once; on the S3 four floats a load where the buffers are on 16 bytes (channel scratch now is). An output the limiter leaves alone takes no clamp pass: its peaks are the limiter's. Same buses bit for bit wherever nothing fuses a multiply-add; on the S3 a send rounds once, not twice.",

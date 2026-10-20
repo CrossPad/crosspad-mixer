@@ -2,33 +2,34 @@
  * @file MixerApp.cpp
  * @brief Mixer and signal router, sized for a finger.
  *
- * The categories are tabs along the bottom, one page each:
+ * "Mixer ·" on "CrossPad UX2000 Touch.html": five tabs along the top, the
+ * section's rows under them, the soft keys along the bottom.
  *
- *   IN       what comes into the board: the mics, the line-in jacks, USB
- *            audio from the host. The mics and the jacks carry their input
- *            GAIN, and each input its MONITOR: which of the outputs you hear
- *            -- 1/2, 3/4, both or neither (the outputs the engine marks heard;
- *            a recording bus keeps its own send). Where the board has more
- *            inputs than ADCs, the PAIR on top picks the two it hears; the
- *            input left out stays on the desk, dimmed, its gain and sends
- *            kept for when a pair takes it back.
- *   SOURCES  what the board plays: the sampler, the pitched instrument, the
- *            click, the song, the recorder's and slicer's preview.
- *   OUT      the masters: speakers, phones, the USB recording bus.
- *   ROUTE    the send matrix: which source goes to which output, how loud.
- *   PRESETS  (the list icon) the whole desk saved under a name, loaded back:
- *            STREAM, BEATS, SAMPLING start as a starting point for their
- *            name until saved over; UNDO puts back what a load replaced.
+ *   IN       what comes into the board: the mics, the line-in sockets, USB
+ *            audio from the host. The zone is the input's GAIN (or PAN), MON
+ *            sends it to every output you hear, and an input with a choice of
+ *            sockets has a row per socket and a key that listens to it. Where
+ *            the board has more inputs than ADCs, PAIR picks the two it hears;
+ *            the input left out stays on the desk, dimmed.
+ *   SOURCES  what the board plays: LEVEL or PAN in the zone, M and S.
+ *   OUT      the masters -- speakers, phones, the USB recording bus -- and a
+ *            speaker or jack the hardware gives a level of its own: LEVEL, M,
+ *            and LIM lit while the limiter works.
+ *   ROUTE    which source and input goes to which output, a chip each; CLEAR
+ *            and RESET (everything to what is heard).
+ *   PRESETS  the whole desk saved under a name, loaded back; UNDO puts back
+ *            what a load replaced.
  *
- * A channel is one row: its name, a long fader in dB with a post-fader meter
- * under it, the dB, mute and solo -- an input has MON where the others have
- * solo. Tap the name for the rest of the channel: input gain, monitor, pan,
- * and its sends.
+ * A row: its name, a 152 px zone a finger drags (level, or pan on the PAN
+ * page; the meter in it on IN and OUT), the value under it, two keys. Tap
+ * the name for the rest of the channel: its sends, monitor, pan -- an
+ * output's tone. The encoder turns the focused row and clicks to the next
+ * one, past the last to the next section.
  *
- * The engine is the only state: widgets are written from it every tick
- * unless a finger or the encoder has hold of them, so anything else that
- * moves the mix (HIL, a loaded state) shows up here. On close the app asks
- * the engine to persist (notifyStateChanged). The pads keep playing the kit.
+ * The engine is the only state: rows are painted from it every tick, so
+ * anything else that moves the mix (HIL, a loaded state) shows up here. On
+ * close the app asks the engine to persist (notifyStateChanged). The pads
+ * keep playing the kit.
  */
 
 #include "crosspad-mixer/MixerApp.hpp"
@@ -46,6 +47,7 @@
 #include "crosspad/audio/IInputPairs.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad/audio/IOutputLevels.hpp"
+#include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -65,33 +67,26 @@ namespace {
 
 constexpr int      kMaxRows    = kMixerMaxChannels + kMixerMaxOutputs;
 constexpr uint32_t kTickMs     = 50;
-constexpr int32_t  kRowH       = 30;
-constexpr int32_t  kTabH       = 30;
-/* Fader travel: 0 is -inf, then 0.6 dB a step up to +6 dB at the top, which
- * puts unity at 90 -- most of the travel where the ear works, a little
- * headroom above it, as on a desk. */
-constexpr int32_t  kFaderMax   = 100;
-constexpr int32_t  kFaderUnity = 90;
-constexpr float    kDbPerStep  = 0.6f;
-constexpr float    kMeterFloorDb = -60.0f;
 
 const lv_color_t kBg      = lv_color_hex(0x16181B);
 const lv_color_t kRowBg   = lv_color_hex(0x20242A);
+const lv_color_t kWell    = lv_color_hex(0x1B1E22);
+const lv_color_t kPress   = lv_color_hex(0x2C3138);
 const lv_color_t kTrack   = lv_color_hex(0x3A3F47);
-const lv_color_t kKnob    = lv_color_hex(0xE8EAED);
+const lv_color_t kKnob    = lv_color_hex(0xFFFFFF);
 const lv_color_t kText    = lv_color_hex(0xE8EAED);
 const lv_color_t kDim     = lv_color_hex(0x7B828B);
-const lv_color_t kInk     = lv_color_hex(0x16181B);
+const lv_color_t kInk     = lv_color_hex(0x06120C);
 const lv_color_t kAccent  = lv_color_hex(0xC6FF47);
+const lv_color_t kTeal    = lv_color_hex(0x4FE0B0);
+const lv_color_t kSky     = lv_color_hex(0x4FC3F7);
+const lv_color_t kWave    = lv_color_hex(0x9CD639);
 const lv_color_t kMute    = lv_color_hex(0xFF5C5C);
 const lv_color_t kSolo    = lv_color_hex(0xFFC857);
 const lv_color_t kFocus   = lv_color_hex(0xFFFFFF);
-const lv_color_t kMeterOk = lv_color_hex(0x4FE0B0);
-const lv_color_t kMeterHi = lv_color_hex(0xFFC857);
-const lv_color_t kMeterClip = lv_color_hex(0xFF5C5C);
+constexpr float    kMeterFloorDb = -60.0f;
 
 enum Page : uint8_t { kIn, kSources, kOut, kRoute, kPresets, kPages };
-const char* const kPageNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", LV_SYMBOL_LIST};
 
 /// How a channel is named, coloured and filed, by the name it registers under.
 struct Look { const char* name; const char* label; uint32_t color; Page page; };
@@ -144,32 +139,30 @@ struct Row {
      * its fader and mute are the hardware's, its meter the bus's. -1 else. */
     int8_t    level = -1;
     Page      page = kSources;
+    /* The widgets while the row's section is on screen, null otherwise. */
     lv_obj_t* box = nullptr;
-    lv_obj_t* name = nullptr;    // the button that opens the channel
-    lv_obj_t* sub = nullptr;     // under the name: gain, pan, "master"
-    lv_obj_t* fader = nullptr;
+    lv_obj_t* name = nullptr;
+    lv_obj_t* sub = nullptr;     // under the name: pan, the socket, the role
+    lv_obj_t* zone = nullptr;    // the fader's touch zone
+    lv_obj_t* fill = nullptr;
+    lv_obj_t* center = nullptr;  // the pan page's centre line
     lv_obj_t* meter = nullptr;
-    lv_obj_t* db = nullptr;
-    lv_obj_t* mute = nullptr;
-    lv_obj_t* solo = nullptr;
-    lv_obj_t* mon = nullptr;     // inputs: which heard outputs get it
+    lv_obj_t* peakMark = nullptr;
+    lv_obj_t* knob = nullptr;
+    lv_obj_t* val = nullptr;     // under the zone: dB, gain, pan
+    lv_obj_t* k[2] = {};
     float     shown = 0.0f;      // meter, decaying
+    float     peakHold = 0.0f;
+    uint8_t   limitLit = 0;      // ticks the limiter's light stays on
 };
 
 Row       s_rows[kMaxRows];
 int       s_rowCount = 0;
 uint8_t   s_sources[kMixerMaxChannels];   // ROUTE's rows: every channel
 int       s_sourceCount = 0;
-lv_obj_t* s_sends[kMixerMaxChannels][kMixerMaxOutputs] = {};
-lv_obj_t* s_sendLabels[kMixerMaxChannels][kMixerMaxOutputs] = {};
-lv_obj_t* s_routeRows[kMixerMaxChannels] = {};
-constexpr int kMaxPairs = 4;
-lv_obj_t* s_pairs[kMaxPairs] = {};       // IN: the input pair, one button each
 
 lv_obj_t* s_root = nullptr;
-lv_obj_t* s_pages[kPages] = {};
 lv_obj_t* s_tabs[kPages] = {};
-lv_obj_t* s_back = nullptr;
 Page      s_page = kSources;
 lv_timer_t* s_timer = nullptr;
 
@@ -281,32 +274,7 @@ void short_output_name(char* buf, size_t n, uint8_t o)
 }
 
 /// What the MON button says for @p mask.
-void monitor_text(char* buf, size_t n, uint32_t mask)
-{
-    uint8_t heard[kMixerMaxOutputs];
-    const int count = heard_outputs(heard);
-    if (!mask) { std::snprintf(buf, n, "off"); return; }
-    if (count > 1 && mask == (1u << count) - 1) { std::snprintf(buf, n, count == 2 ? "both" : "all"); return; }
-    for (int i = 0; i < count; ++i) {
-        if (mask == (1u << i)) { short_output_name(buf, n, heard[i]); return; }
-    }
-    std::snprintf(buf, n, "some");
-}
-
 // ── scales and text ────────────────────────────────────────────────────────
-
-float fader_to_gain(int32_t v)
-{
-    if (v <= 0) return 0.0f;
-    return powf(10.0f, ((float)(v - kFaderUnity) * kDbPerStep) / 20.0f);
-}
-
-int32_t gain_to_fader(float g)
-{
-    if (g <= 0.0f) return 0;
-    const int32_t v = (int32_t)lroundf(20.0f * log10f(g) / kDbPerStep) + kFaderUnity;
-    return v < 1 ? 1 : (v > kFaderMax ? kFaderMax : v);
-}
 
 void set_text(lv_obj_t* l, const char* t)
 {
@@ -334,11 +302,6 @@ int32_t peak_to_meter(float peak)
     if (db <= kMeterFloorDb) return 0;
     if (db >= 0.0f) return 100;
     return (int32_t)(100.0f * (db - kMeterFloorDb) / -kMeterFloorDb);
-}
-
-bool held(lv_obj_t* o)
-{
-    return o && (lv_obj_has_state(o, LV_STATE_EDITED) || lv_obj_has_state(o, LV_STATE_PRESSED));
 }
 
 // ── widgets ────────────────────────────────────────────────────────────────
@@ -406,65 +369,8 @@ lv_obj_t* make_slider(lv_obj_t* parent, int32_t min, int32_t max, lv_color_t fil
     return s;
 }
 
-// ── channel callbacks ──────────────────────────────────────────────────────
-
-Row& row_of(lv_event_t* e) { return s_rows[(int)(intptr_t)lv_event_get_user_data(e)]; }
-
-void fader_cb(lv_event_t* e)
-{
-    Row& r = row_of(e);
-    if (r.level >= 0) {
-        const int32_t v = lv_slider_get_value(r.fader);
-        output_levels()->setLevel(r.level, (int)v);
-        char lvl[8];
-        std::snprintf(lvl, sizeof(lvl), "%d", (int)v);
-        set_text(r.db, lvl);
-        return;
-    }
-    const float g = fader_to_gain(lv_slider_get_value(r.fader));
-    auto& m = getMixerEngine();
-    if (r.output) m.setOutputVolume(r.id, g);
-    else          m.setChannelVolume(r.id, g);
-    char buf[12];
-    db_text(buf, sizeof(buf), g);
-    set_text(r.db, buf);
-}
-
-void mute_cb(lv_event_t* e)
-{
-    Row& r = row_of(e);
-    if (r.level >= 0) {
-        crosspad::IOutputLevels* ol = output_levels();
-        ol->setMuted(r.level, !ol->muted(r.level));
-        return;
-    }
-    auto& m = getMixerEngine();
-    if (r.output) m.setOutputMute(r.id, !m.isOutputMuted(r.id));
-    else          m.setChannelMute(r.id, !m.isChannelMuted(r.id));
-}
-
-void solo_cb(lv_event_t* e)
-{
-    Row& r = row_of(e);
-    auto& m = getMixerEngine();
-    m.setChannelSolo(r.id, !m.isChannelSoloed(r.id));
-}
-
-/// A tap moves MONITOR on: off, each heard output alone, then all of them.
-void mon_cb(lv_event_t* e)
-{
-    Row& r = row_of(e);
-    uint8_t heard[kMixerMaxOutputs];
-    const int n = heard_outputs(heard);
-    if (!n) return;
-    set_monitor(r.id, (monitor_mask(r.id) + 1) & ((1u << n) - 1));
-}
 
 // ── the channel window: gain, pan, sends ───────────────────────────────────
-
-void rebuild_group();
-void add_presets_to_group();
-void refresh_presets();
 
 /* An output's window is its tone: three bands across what that output plays
  * through, which is what evening out a speaker or a pair of headphones takes.
@@ -801,13 +707,13 @@ int live_src_of(uint8_t ch)
     return gains()->source(gi);
 }
 
-void name_cb(lv_event_t* e)
+/// A tap on a row's name: one converter, two sockets -- the one that is not
+/// live is made live rather than opening a channel the row does not really
+/// own yet; any other row opens the rest of the channel.
+void name_cb_idx(int idx)
 {
-    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= s_rowCount) return;
     const Row& r = s_rows[idx];
-    /* One converter, two sockets: a tap on the one that is not live makes it
-     * live rather than opening a channel the row does not really own yet. */
     if (r.src >= 0 && live_src_of(r.id) != r.src) {
         if (gains()) gains()->setSource(gain_input_of(r.id), r.src);
         return;
@@ -815,87 +721,8 @@ void name_cb(lv_event_t* e)
     open_detail(idx);
 }
 
-// ── pages ──────────────────────────────────────────────────────────────────
+// ── presets: the name window ───────────────────────────────────────────────
 
-void add_to_group(lv_obj_t* o)
-{
-#ifdef MIXER_USE_ENCODER
-    if (s_encGroup && o) lv_group_add_obj(s_encGroup, o);
-#else
-    (void)o;
-#endif
-}
-
-/// The encoder walks the page on screen, then the tabs.
-void rebuild_group()
-{
-#ifdef MIXER_USE_ENCODER
-    if (!s_encGroup) return;
-    lv_obj_t* focused = lv_group_get_focused(s_encGroup);
-    lv_group_remove_all_objs(s_encGroup);
-    if (s_page == kIn) {
-        for (auto* b : s_pairs) add_to_group(b);
-    }
-    if (s_page == kRoute) {
-        for (int row = 0; row < s_sourceCount; ++row)
-            for (int o = 0; o < kMixerMaxOutputs; ++o) add_to_group(s_sends[row][o]);
-    } else if (s_page == kPresets) {
-        add_presets_to_group();
-    } else {
-        for (int i = 0; i < s_rowCount; ++i) {
-            const Row& r = s_rows[i];
-            if (r.page != s_page) continue;
-            /* An output's name opens its tone, so it belongs in the walk --
-             * but only an output that can carry an EQ. */
-            if (!r.output || r.id < kMixerEqOutputs) add_to_group(r.name);
-            if (!lv_obj_has_state(r.fader, LV_STATE_DISABLED)) add_to_group(r.fader);
-            add_to_group(r.mute);
-            add_to_group(r.solo);
-            add_to_group(r.mon);
-        }
-    }
-    add_to_group(s_back);
-    for (auto* t : s_tabs) add_to_group(t);
-    bool alive = false;
-    for (uint32_t k = 0; k < lv_group_get_obj_count(s_encGroup); ++k) {
-        if (lv_group_get_obj_by_index(s_encGroup, k) == focused) { alive = true; break; }
-    }
-    if (alive) lv_group_focus_obj(focused);
-#endif
-}
-
-void show_page(Page p)
-{
-    s_page = p;
-    for (int i = 0; i < kPages; ++i) {
-        if (!s_pages[i]) continue;
-        if (i == p) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        else        lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        paint(s_tabs[i], i == p, kAccent);
-    }
-    if (p == kPresets) refresh_presets();     // the card is read when the list is shown
-    rebuild_group();
-}
-
-void tab_cb(lv_event_t* e) { show_page((Page)(intptr_t)lv_event_get_user_data(e)); }
-
-void back_cb(lv_event_t* e)
-{
-    auto* app = static_cast<App*>(lv_event_get_user_data(e));
-    if (app) app->destroyAppAsync();
-}
-
-// ── presets ────────────────────────────────────────────────────────────────
-
-struct PresetRow {
-    lv_obj_t* name = nullptr;
-    lv_obj_t* sub = nullptr;
-    lv_obj_t* load = nullptr;
-    lv_obj_t* save = nullptr;
-};
-PresetRow s_pre[crosspad::MixerPresets::kSlots];
-lv_obj_t* s_preStatus = nullptr;
-lv_obj_t* s_preUndo = nullptr;
 lv_obj_t* s_nameOv = nullptr;          // the name window a SAVE opens
 lv_obj_t* s_nameText = nullptr;
 int       s_nameSlot = -1;
@@ -903,56 +730,13 @@ int       s_nameSlot = -1;
 lv_group_t* s_nameGroup = nullptr;
 #endif
 
-void add_presets_to_group()
-{
-    if (s_preUndo && !lv_obj_has_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN)) add_to_group(s_preUndo);
-    for (auto& r : s_pre) {
-        add_to_group(r.load);
-        add_to_group(r.save);
-    }
-}
+void build_section();
 
-void refresh_presets()
-{
-    auto& pr = crosspad::getMixerPresets();
-    pr.refresh();
-    for (int s = 0; s < crosspad::MixerPresets::kSlots; ++s) {
-        const auto& i = pr.info(s);
-        set_text(s_pre[s].name, i.name.c_str());
-        set_text(s_pre[s].sub, i.kind == crosspad::MixerPresets::Kind::Saved   ? "saved"
-                             : i.kind == crosspad::MixerPresets::Kind::Factory ? "starting point"
-                                                                                : "empty -- SAVE the desk here");
-        if (i.kind == crosspad::MixerPresets::Kind::Empty) lv_obj_add_state(s_pre[s].load, LV_STATE_DISABLED);
-        else lv_obj_remove_state(s_pre[s].load, LV_STATE_DISABLED);
-    }
-    if (!pr.available()) set_text(s_preStatus, "Presets need the card.");
-    if (pr.canUndo()) lv_obj_remove_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
-    else              lv_obj_add_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
-}
-
-void preset_status(const char* fmt, const std::string& name)
+void preset_toast(const char* fmt, const std::string& name)
 {
     char buf[64];
     std::snprintf(buf, sizeof(buf), fmt, name.c_str());
-    set_text(s_preStatus, buf);
-}
-
-void load_cb(lv_event_t* e)
-{
-    const int s = (int)(intptr_t)lv_event_get_user_data(e);
-    auto& pr = crosspad::getMixerPresets();
-    const std::string name = pr.info(s).name;
-    if (pr.load(s)) preset_status("%s loaded -- UNDO puts the desk back.", name);
-    else            preset_status("%s could not be read.", name);
-    refresh_presets();
-    rebuild_group();
-}
-
-void undo_cb(lv_event_t*)
-{
-    if (crosspad::getMixerPresets().undo()) set_text(s_preStatus, "The desk is back as it was.");
-    refresh_presets();
-    rebuild_group();
+    ui_toast_show(buf);
 }
 
 void close_name()
@@ -975,18 +759,18 @@ void name_done_cb(lv_event_t* e)
     const int s = s_nameSlot;
     close_name();
     if (!ok || s < 0) return;
-    if (name.empty()) { set_text(s_preStatus, "A preset needs a name."); return; }
-    if (crosspad::getMixerPresets().save(s, name)) preset_status("The desk is saved as %s.", name);
-    else                                           preset_status("%s not saved: is the card in?", name);
-    refresh_presets();
+    if (name.empty()) { ui_toast_show("A preset needs a name"); return; }
+    if (crosspad::getMixerPresets().save(s, name)) preset_toast("The desk is saved as %s", name);
+    else                                           preset_toast("%s not saved: is the card in?", name);
+    build_section();
 }
 
-/// SAVE asks for the name, the slot's own filled in: OK saves, the name
+/// SAVE AS asks for the name, the slot's own filled in: OK saves, the name
 /// window is the "are you sure" too.
-void save_cb(lv_event_t* e)
+void open_name(int slot)
 {
     if (s_nameOv) return;
-    s_nameSlot = (int)(intptr_t)lv_event_get_user_data(e);
+    s_nameSlot = slot;
     s_nameOv = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_nameOv);
     lv_obj_set_size(s_nameOv, LV_PCT(100), LV_PCT(100));
@@ -1019,53 +803,6 @@ void save_cb(lv_event_t* e)
 #endif
 }
 
-void build_presets(lv_obj_t* page)
-{
-    lv_obj_t* top = make_box(page);
-    lv_obj_set_size(top, LV_PCT(100), 26);
-    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(top, 4, 0);
-    s_preStatus = lv_label_create(top);
-    lv_obj_set_flex_grow(s_preStatus, 1);
-    lv_obj_set_style_text_font(s_preStatus, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(s_preStatus, kDim, 0);
-    lv_label_set_long_mode(s_preStatus, LV_LABEL_LONG_DOT);
-    lv_label_set_text(s_preStatus, "Levels, mutes, pan, sends, outputs, input gain.");
-    s_preUndo = make_button(top, 64, 24, LV_SYMBOL_REFRESH " UNDO", undo_cb, nullptr, &lv_font_montserrat_10);
-    lv_obj_add_flag(s_preUndo, LV_OBJ_FLAG_HIDDEN);
-
-    for (int s = 0; s < crosspad::MixerPresets::kSlots; ++s) {
-        lv_obj_t* r = make_box(page);
-        lv_obj_set_size(r, LV_PCT(100), kRowH);
-        lv_obj_set_style_bg_color(r, kRowBg, 0);
-        lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(r, 6, 0);
-        lv_obj_set_style_pad_hor(r, 6, 0);
-        lv_obj_set_style_pad_column(r, 4, 0);
-        lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_t* col = make_box(r);
-        lv_obj_set_height(col, kRowH - 2);
-        lv_obj_set_flex_grow(col, 1);
-        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-        s_pre[s].name = lv_label_create(col);
-        lv_obj_set_style_text_font(s_pre[s].name, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(s_pre[s].name, kText, 0);
-        lv_label_set_text(s_pre[s].name, "");
-        s_pre[s].sub = lv_label_create(col);
-        lv_obj_set_style_text_font(s_pre[s].sub, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(s_pre[s].sub, kDim, 0);
-        lv_label_set_text(s_pre[s].sub, "");
-        s_pre[s].load = make_button(r, 58, 24, "LOAD", load_cb, (void*)(intptr_t)s);
-        lv_obj_set_style_bg_color(s_pre[s].load, kAccent, 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(s_pre[s].load, 0), kInk, 0);
-        lv_obj_set_style_bg_opa(s_pre[s].load, LV_OPA_30, LV_STATE_DISABLED);
-        s_pre[s].save = make_button(r, 58, 24, LV_SYMBOL_SAVE " SAVE", save_cb, (void*)(intptr_t)s);
-    }
-}
-
 bool back_handler(lv_obj_t*)
 {
     if (s_nameOv) { close_name(); return true; }
@@ -1073,368 +810,792 @@ bool back_handler(lv_obj_t*)
     return false;
 }
 
+// ── the desk: tabs, rows, soft keys ────────────────────────────────────────
+//
+// "Mixer ·" on "CrossPad UX2000 Touch.html", 320 x 200 under the transport
+// bar: the five tabs on top (59 x 36), the section's rows under them (312 x
+// 44, 4 apart, scrolling), three or four soft keys along the bottom (42 tall).
+
+constexpr int32_t kTabY  = 4,   kTabW = 59, kTabH = 36, kTabStep = 63;
+constexpr int32_t kListY = 44,  kListH = 106;
+constexpr int32_t kKeyY  = 154, kKeyH = 42;
+constexpr int32_t kRowW  = 312, kRowH = 44, kRowStep = 48;
+constexpr int32_t kZoneX = 84,  kZoneW = 152;          // the fader's touch zone
+constexpr int32_t kTogX  = 236, kTogW = 34, kTogStep = 38;
+constexpr int     kKeys  = 4;
+constexpr int     kVisMax = kMaxRows > kMixerMaxChannels ? kMaxRows : kMixerMaxChannels;
+
+const char* const kTabNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", "PRESETS"};
+
+/// What each row's fader zone moves: the level (an input's GAIN) or the pan.
+uint8_t s_fpage[kPages] = {};
+int     s_vis[kVisMax];            // the rows on screen: s_rows indices, ROUTE's channel ids or preset slots
+int     s_nvis = 0;
+int     s_focus = 0;               // index into s_vis
+int     s_psel = 0;                // PRESETS: the slot the keys act on
+int     s_loaded = -1;             // PRESETS: the slot last loaded here
+lv_obj_t* s_list = nullptr;
+lv_obj_t* s_keys[kKeys] = {};
+lv_obj_t* s_visRow[kVisMax] = {};  // each visible row's box
+lv_obj_t* s_chips[kMixerMaxChannels][kMixerMaxOutputs] = {};
+lv_obj_t* s_rowSub[kVisMax] = {};  // ROUTE / PRESETS rows: the line under the name
+lv_obj_t* s_rowTag[kVisMax] = {};  // PRESETS: LOADED
+
+bool fader_page(Page p) { return p == kIn || p == kSources || p == kOut; }
+
+// ── values: the zone's 0..1 and what it means ──────────────────────────────
+
+/// Level <-> gain: unity at 78 % of the travel, a cube, so most of the travel
+/// is where the ear works and the top is +6.5 dB.
+constexpr float kUnityPos = 0.78f;
+float pos_to_gain(float k)
+{
+    if (k <= 0.001f) return 0.0f;
+    const float x = k / kUnityPos;
+    return x * x * x;
+}
+float gain_to_pos(float g)
+{
+    if (g <= 0.0f) return 0.0f;
+    const float k = cbrtf(g) * kUnityPos;
+    return k > 1.0f ? 1.0f : k;
+}
+
+/// Whether row @p r is the socket its converter is not listening to.
+bool socket_idle(const Row& r) { return r.src >= 0 && live_src_of(r.id) != r.src; }
+
+/// The row's level, 0..1 along the zone.
+float row_level(const Row& r)
+{
+    auto& m = getMixerEngine();
+    if (r.level >= 0) return (float)output_levels()->level(r.level) / 100.0f;
+    if (r.output) return gain_to_pos(m.getOutputVolume(r.id));
+    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
+    if (gi >= 0) return gains()->gainDb(gi) / gains()->maxDb();
+    return gain_to_pos(m.getChannelVolume(r.id));
+}
+
+void set_row_level(const Row& r, float k)
+{
+    k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+    auto& m = getMixerEngine();
+    if (r.level >= 0) { output_levels()->setLevel(r.level, (int)lroundf(k * 100.0f)); return; }
+    if (r.output) { m.setOutputVolume(r.id, pos_to_gain(k)); return; }
+    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
+    if (gi >= 0) {
+        auto* g = gains();
+        g->setGainDb(gi, lroundf(k * g->maxDb() / g->stepDb()) * g->stepDb());
+        return;
+    }
+    m.setChannelVolume(r.id, pos_to_gain(k));
+}
+
+/// "GAIN +12 dB", "+0.0 dB", "80" -- what the level reads under the zone.
+void level_text(const Row& r, char* buf, size_t n)
+{
+    auto& m = getMixerEngine();
+    char db[12];
+    if (r.level >= 0) { std::snprintf(buf, n, "%d", output_levels()->level(r.level)); return; }
+    if (r.output) { db_text(db, sizeof(db), m.getOutputVolume(r.id)); std::snprintf(buf, n, "%s dB", db); return; }
+    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
+    if (gi >= 0) { std::snprintf(buf, n, "GAIN +%.0f dB", (double)gains()->gainDb(gi)); return; }
+    db_text(db, sizeof(db), m.getChannelVolume(r.id));
+    std::snprintf(buf, n, "%s%s dB", r.page == kIn ? "GAIN " : "", db);
+}
+
+/// Rows whose zone has a pan page: channels, not outputs.
+bool has_pan(const Row& r) { return !r.output; }
+
+// ── widgets of the desk ────────────────────────────────────────────────────
+
+lv_obj_t* plain(lv_obj_t* p, int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius, lv_color_t c,
+                lv_opa_t opa = LV_OPA_COVER)
+{
+    lv_obj_t* o = make_box(p);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_radius(o, radius, 0);
+    lv_obj_set_style_bg_color(o, c, 0);
+    lv_obj_set_style_bg_opa(o, opa, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    return o;
+}
+
+lv_obj_t* text(lv_obj_t* p, const lv_font_t* f, lv_color_t c, int32_t x, int32_t y, const char* t)
+{
+    lv_obj_t* l = lv_label_create(p);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, c, 0);
+    lv_obj_set_pos(l, x, y);
+    lv_label_set_text(l, t ? t : "");
+    lv_obj_remove_flag(l, LV_OBJ_FLAG_CLICKABLE);
+    return l;
+}
+
+/// A key: a panel, pressed a shade lighter; SHORT_CLICKED, so a drag that
+/// scrolls the list never toggles anything.
+lv_obj_t* key(lv_obj_t* p, int32_t x, int32_t y, int32_t w, int32_t h, const char* t, lv_event_cb_t cb,
+              void* ud)
+{
+    lv_obj_t* b = plain(p, x, y, w, h, 6, kRowBg);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(b, kPress, LV_STATE_PRESSED);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, (std::strlen(t) > 2 && w < 60) ? &lv_font_montserrat_10 : &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, t);
+    lv_obj_center(l);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_SHORT_CLICKED, ud);
+    return b;
+}
+
+/// On: the key filled in @p on, ink on it; off: the panel, @p off on it.
+void key_on(lv_obj_t* b, bool on, lv_color_t onCol, lv_color_t off = kText)
+{
+    if (!b) return;
+    const lv_color_t bg = on ? onCol : kRowBg;
+    if (!lv_color_eq(lv_obj_get_style_bg_color(b, LV_PART_MAIN), bg)) lv_obj_set_style_bg_color(b, bg, 0);
+    lv_obj_t* l = lv_obj_get_child(b, 0);
+    const lv_color_t ink = on ? kInk : off;
+    if (l && !lv_color_eq(lv_obj_get_style_text_color(l, LV_PART_MAIN), ink)) lv_obj_set_style_text_color(l, ink, 0);
+}
+
+lv_color_t row_color(const Row& r)
+{
+    if (r.page == kIn) return kSky;
+    if (r.output) return kAccent;
+    const Look* look = look_for(getMixerEngine().getChannelName(r.id));
+    return look ? lv_color_hex(look->color) : kText;
+}
+
+const char* row_name(const Row& r)
+{
+    auto& m = getMixerEngine();
+    if (r.level >= 0) return output_levels()->name(r.level);
+    if (r.output) return m.getOutputName(r.id);
+    if (r.src >= 0) return gains()->sourceName(gain_input_of(r.id), r.src);
+    const Look* look = look_for(m.getChannelName(r.id));
+    return look ? look->label : m.getChannelName(r.id);
+}
+
+// ── painting ───────────────────────────────────────────────────────────────
+
+void paint_row(int vi);
+void paint_keys();
+void build_section();
+
+/// A fader row: the zone's fill or pan, the knob, the value; the meter on the
+/// level page of IN and OUT; the two keys.
+void paint_fader_row(int vi)
+{
+    Row& r = s_rows[s_vis[vi]];
+    if (!r.box) return;
+    auto& m = getMixerEngine();
+    const bool pan = s_fpage[s_page] == 1 && has_pan(r);
+    const bool meter = !pan && s_page != kSources;
+    const bool idle = socket_idle(r) || !connected(r.id);
+    bool muted = false, dimmed = idle;
+    if (r.level >= 0) muted = output_levels()->muted(r.level);
+    else if (r.output) muted = m.isOutputMuted(r.id);
+    else if (s_page == kSources) {
+        muted = m.isChannelMuted(r.id);
+        dimmed = muted || (m.isAnySoloed() && !m.isChannelSoloed(r.id));
+    }
+    lv_obj_set_style_border_width(r.box, vi == s_focus ? 2 : 0, 0);
+    lv_obj_set_style_text_color(r.name, dimmed ? kDim : kText, 0);
+
+    char buf[24];
+    const int32_t mid = kZoneW / 2;
+    int32_t x;
+    if (pan) {
+        const float p = m.getChannelPan(r.id);
+        x = mid + (int32_t)lroundf(p * (float)mid);
+        lv_obj_remove_flag(r.center, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_x(r.fill, x < mid ? x : mid);
+        lv_obj_set_width(r.fill, x < mid ? mid - x : x - mid);
+        pan_text(buf, sizeof(buf), p);
+        set_text(r.val, buf + 4);                  // "pan L12" -> "L12"
+    } else {
+        x = (int32_t)lroundf(row_level(r) * (float)kZoneW);
+        lv_obj_add_flag(r.center, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_x(r.fill, 0);
+        lv_obj_set_width(r.fill, meter ? 0 : x);
+        level_text(r, buf, sizeof(buf));
+        set_text(r.val, buf);
+    }
+    lv_obj_set_style_bg_color(r.fill, dimmed ? kDim : row_color(r), 0);
+    if (!lv_obj_has_state(r.zone, LV_STATE_PRESSED)) lv_obj_set_x(r.knob, x - 6);
+    if (meter) {
+        lv_obj_remove_flag(r.meter, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(r.peakMark, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(r.meter, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(r.peakMark, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* The line under the name: what the row is. */
+    if (r.level >= 0)                     set_text(r.sub, output_role(m.getOutputName(r.id)));
+    else if (r.output)                    set_text(r.sub, output_role(m.getOutputName(r.id)));
+    else if (r.src >= 0)                  set_text(r.sub, idle ? "tap name: listen" : "listening");
+    else if (!connected(r.id))            set_text(r.sub, "not in pair");
+    else if (s_page == kSources || s_page == kIn) {
+        pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
+        set_text(r.sub, buf);
+    }
+
+    /* The keys: IN MON + its socket, SOURCES M S, OUT M LIM. */
+    if (s_page == kIn) {
+        key_on(r.k[0], monitor_mask(r.id) != 0, kSky);
+        if (r.k[1]) key_on(r.k[1], !idle, kSky);
+    } else if (s_page == kSources) {
+        key_on(r.k[0], muted, kMute);
+        key_on(r.k[1], m.isChannelSoloed(r.id), kSolo);
+    } else {
+        key_on(r.k[0], muted, kMute);
+        key_on(r.k[1], r.limitLit > 0, kSolo);
+    }
+}
+
+void paint_route_row(int vi)
+{
+    lv_obj_t* box = s_visRow[vi];
+    if (!box) return;
+    auto& m = getMixerEngine();
+    const uint8_t ch = (uint8_t)s_vis[vi];
+    lv_obj_set_style_border_width(box, vi == s_focus ? 2 : 0, 0);
+    int n = 0;
+    for (uint8_t o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
+        const bool on = m.isRouteEnabled(ch, o);
+        key_on(s_chips[vi][o], on, kTeal);
+        n += on;
+    }
+    char buf[12];
+    std::snprintf(buf, sizeof(buf), "%d out%s", n, n == 1 ? "" : "s");
+    set_text(s_rowSub[vi], buf);
+    dim(box, !connected(ch));
+}
+
+void paint_preset_row(int vi)
+{
+    lv_obj_t* box = s_visRow[vi];
+    if (!box) return;
+    const bool sel = vi == s_psel;
+    lv_obj_set_style_bg_color(box, sel ? kRowBg : kWell, 0);
+    lv_obj_set_style_border_width(box, sel ? 2 : 0, 0);
+    if (vi == s_loaded) lv_obj_remove_flag(s_rowTag[vi], LV_OBJ_FLAG_HIDDEN);
+    else                lv_obj_add_flag(s_rowTag[vi], LV_OBJ_FLAG_HIDDEN);
+}
+
+void paint_row(int vi)
+{
+    if (vi < 0 || vi >= s_nvis) return;
+    if (fader_page(s_page)) paint_fader_row(vi);
+    else if (s_page == kRoute) paint_route_row(vi);
+    else paint_preset_row(vi);
+}
+
+void paint_all()
+{
+    for (int i = 0; i < s_nvis; ++i) paint_row(i);
+    paint_keys();
+}
+
+/// The soft keys: what the section's rows do and the actions on the focused one.
+const char* key_label(int k, char* buf, size_t n)
+{
+    auto* p = input_pairs();
+    switch (s_page) {
+        case kIn: {
+            static const char* const L[] = {"GAIN", "PAN", "RESET"};
+            if (k < 3) return L[k];
+            if (p && p->pairs() >= 2) { std::snprintf(buf, n, "PAIR %s", p->pairName(p->pair())); return buf; }
+            return nullptr;
+        }
+        case kSources: { static const char* const L[] = {"LEVEL", "PAN", "RESET", nullptr}; return L[k]; }
+        case kOut:     { static const char* const L[] = {"LEVEL", "RESET", nullptr, nullptr}; return L[k]; }
+        case kRoute:   { static const char* const L[] = {"CLEAR", "RESET", nullptr, nullptr}; return L[k]; }
+        default:       { static const char* const L[] = {"LOAD", "SAVE AS", "UNDO", nullptr}; return L[k]; }
+    }
+}
+
+void paint_keys()
+{
+    char bufs[kKeys][24];
+    const char* labels[kKeys];
+    int n = 0;
+    for (int k = 0; k < kKeys; ++k) {
+        labels[k] = key_label(k, bufs[k], sizeof(bufs[k]));
+        if (labels[k]) n = k + 1;
+    }
+    const int32_t w = (kRowW - (n - 1) * 4) / (n ? n : 1);
+    for (int k = 0; k < kKeys; ++k) {
+        lv_obj_t* b = s_keys[k];
+        if (k >= n) { lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(b, 4 + k * (w + 4), kKeyY);
+        lv_obj_set_width(b, w);
+        set_text(lv_obj_get_child(b, 0), labels[k]);
+        lv_obj_set_style_text_font(lv_obj_get_child(b, 0),
+                                   std::strlen(labels[k]) > 7 ? &lv_font_montserrat_10 : &lv_font_montserrat_14, 0);
+        bool on = false;
+        lv_color_t col = kTeal;
+        if (s_page == kIn || s_page == kSources) on = k < 2 && s_fpage[s_page] == k;
+        if (s_page == kOut) on = k == 0;
+        if (s_page == kPresets) {
+            col = kAccent;
+            on = k == 0;
+            const bool can = k == 2 ? crosspad::getMixerPresets().canUndo()
+                                    : crosspad::getMixerPresets().available();
+            lv_obj_set_style_opa(b, can ? LV_OPA_COVER : LV_OPA_40, 0);
+        } else {
+            lv_obj_set_style_opa(b, LV_OPA_COVER, 0);
+        }
+        key_on(b, on, col);
+    }
+    for (int t = 0; t < kPages; ++t) key_on(s_tabs[t], t == s_page, kTeal);
+}
+
+// ── input ──────────────────────────────────────────────────────────────────
+
+void focus_row(int vi, bool scroll)
+{
+    if (vi < 0 || vi >= s_nvis) return;
+    s_focus = vi;
+    if (s_page == kPresets) s_psel = vi;
+    if (scroll && s_visRow[vi]) lv_obj_scroll_to_view(s_visRow[vi], LV_ANIM_ON);
+    paint_all();
+}
+
+void zone_cb(lv_event_t* e)
+{
+    const int vi = (int)(intptr_t)lv_event_get_user_data(e);
+    Row& r = s_rows[s_vis[vi]];
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (socket_idle(r) || !connected(r.id)) return;
+    if (code == LV_EVENT_PRESSED) {
+        s_focus = vi;
+        lv_obj_set_style_bg_color(r.knob, kAccent, 0);
+        paint_all();
+    }
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        lv_obj_set_style_bg_color(r.knob, kKnob, 0);
+        paint_row(vi);
+        return;
+    }
+    lv_point_t p;
+    lv_indev_get_point(lv_indev_active(), &p);
+    lv_area_t a;
+    lv_obj_get_coords(r.zone, &a);
+    float k = (float)(p.x - a.x1) / (float)kZoneW;
+    k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+    if (s_fpage[s_page] == 1 && has_pan(r)) {
+        float pan = k * 2.0f - 1.0f;
+        if (fabsf(pan) < 0.05f) pan = 0.0f;
+        getMixerEngine().setChannelPan(r.id, pan);
+    } else {
+        if (fabsf(k - kUnityPos) < 0.02f && r.level < 0) k = kUnityPos;
+        set_row_level(r, k);
+    }
+    lv_obj_set_x(r.knob, (int32_t)(k * kZoneW) - 6);
+    paint_row(vi);
+}
+
+void tog_cb(lv_event_t* e)
+{
+    const uint32_t d = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const int vi = d & 0xFF, k = (int)(d >> 8);
+    Row& r = s_rows[s_vis[vi]];
+    auto& m = getMixerEngine();
+    s_focus = vi;
+    if (s_page == kIn) {
+        if (k == 0) {
+            uint8_t heard[kMixerMaxOutputs];
+            const int n = heard_outputs(heard);
+            set_monitor(r.id, monitor_mask(r.id) ? 0 : (n ? (1u << n) - 1 : 0));
+        } else if (r.src >= 0 && gains()) {
+            gains()->setSource(gain_input_of(r.id), r.src);
+        }
+    } else if (s_page == kSources) {
+        if (k == 0) m.setChannelMute(r.id, !m.isChannelMuted(r.id));
+        else        m.setChannelSolo(r.id, !m.isChannelSoloed(r.id));
+    } else if (k == 0) {
+        if (r.level >= 0) output_levels()->setMuted(r.level, !output_levels()->muted(r.level));
+        else              m.setOutputMute(r.id, !m.isOutputMuted(r.id));
+    }
+    paint_all();
+}
+
+void row_name_cb(lv_event_t* e)
+{
+    const int vi = (int)(intptr_t)lv_event_get_user_data(e);
+    s_focus = vi;
+    name_cb_idx(s_vis[vi]);
+    paint_all();
+}
+
+void chip_cb(lv_event_t* e)
+{
+    const uint32_t d = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const int vi = d & 0xFF;
+    const uint8_t o = (uint8_t)(d >> 8);
+    auto& m = getMixerEngine();
+    const uint8_t ch = (uint8_t)s_vis[vi];
+    const bool on = !m.isRouteEnabled(ch, o);
+    if (on && m.getRouteVolume(ch, o) <= 0.0f) m.setRouteVolume(ch, o, 1.0f);
+    m.setRouteEnabled(ch, o, on);
+    s_focus = vi;
+    paint_all();
+}
+
+void preset_row_cb(lv_event_t* e) { focus_row((int)(intptr_t)lv_event_get_user_data(e), false); }
+
+void tab_cb(lv_event_t* e)
+{
+    s_page = (Page)(intptr_t)lv_event_get_user_data(e);
+    s_focus = 0;
+    build_section();
+}
+
+/// RESET on a fader section: the focused row's value on the page shown --
+/// unity (no gain on an input), or the centre.
+void reset_row(const Row& r)
+{
+    auto& m = getMixerEngine();
+    if (s_fpage[s_page] == 1 && has_pan(r)) { m.setChannelPan(r.id, 0.0f); return; }
+    if (r.level >= 0) return;                    // the hardware's level has no unity
+    if (r.output) { m.setOutputVolume(r.id, 1.0f); return; }
+    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
+    if (gi >= 0) gains()->setGainDb(gi, 0.0f);
+    else         m.setChannelVolume(r.id, 1.0f);
+}
+
+void do_softkey(int k)
+{
+    auto& m = getMixerEngine();
+    switch (s_page) {
+        case kIn:
+        case kSources:
+            if (k < 2) s_fpage[s_page] = (uint8_t)k;
+            else if (k == 2 && s_focus < s_nvis) reset_row(s_rows[s_vis[s_focus]]);
+            else if (k == 3 && input_pairs()) {
+                auto* p = input_pairs();
+                p->setPair((p->pair() + 1) % p->pairs());
+            }
+            break;
+        case kOut:
+            if (k == 1 && s_focus < s_nvis) reset_row(s_rows[s_vis[s_focus]]);
+            break;
+        case kRoute:
+            if (k == 0 && s_focus < s_nvis) {
+                for (uint8_t o = 0; o < m.numOutputs(); ++o) m.setRouteEnabled((uint8_t)s_vis[s_focus], o, false);
+            } else if (k == 1) {
+                /* Everything to what is heard, at unity; nothing to a
+                 * recording bus. */
+                for (int i = 0; i < s_nvis; ++i) {
+                    const uint8_t ch = (uint8_t)s_vis[i];
+                    for (uint8_t o = 0; o < m.numOutputs(); ++o) {
+                        const bool on = m.isOutputHeard(o);
+                        if (on) m.setRouteVolume(ch, o, 1.0f);
+                        m.setRouteEnabled(ch, o, on);
+                    }
+                }
+            }
+            break;
+        default: {
+            auto& pr = crosspad::getMixerPresets();
+            const std::string name = pr.info(s_psel).name;
+            if (k == 0) {
+                if (pr.info(s_psel).kind == crosspad::MixerPresets::Kind::Empty) {
+                    ui_toast_show("Nothing saved there yet");
+                } else if (pr.load(s_psel)) {
+                    s_loaded = s_psel;
+                    preset_toast("%s loaded -- UNDO puts the desk back", name);
+                } else {
+                    preset_toast("%s could not be read", name);
+                }
+            } else if (k == 1) {
+                open_name(s_psel);
+            } else if (pr.undo()) {
+                s_loaded = -1;
+                ui_toast_show("The desk is back as it was");
+            }
+            build_section();
+            return;
+        }
+    }
+    paint_all();
+}
+
+void softkey_cb(lv_event_t* e) { do_softkey((int)(intptr_t)lv_event_get_user_data(e)); }
+
+/// The encoder: turned, the focused row's value (a preset: the selection);
+/// clicked, the next row, and past the last, the next section.
+void root_key_cb(lv_event_t* e)
+{
+    const uint32_t key = lv_event_get_key(e);
+    const int d = (key == LV_KEY_RIGHT || key == LV_KEY_UP) ? 1 : (key == LV_KEY_LEFT || key == LV_KEY_DOWN) ? -1 : 0;
+    if (!d || !s_nvis) return;
+    if (s_page == kPresets || s_page == kRoute) {
+        int f = s_focus + d;
+        f = f < 0 ? 0 : (f >= s_nvis ? s_nvis - 1 : f);
+        focus_row(f, true);
+        return;
+    }
+    Row& r = s_rows[s_vis[s_focus]];
+    if (socket_idle(r) || !connected(r.id)) return;
+    if (s_fpage[s_page] == 1 && has_pan(r)) {
+        float p = getMixerEngine().getChannelPan(r.id) + (float)d * 0.02f;
+        getMixerEngine().setChannelPan(r.id, p < -1.0f ? -1.0f : (p > 1.0f ? 1.0f : p));
+    } else {
+        const int gi = r.page == kIn && !r.output ? gain_input_of(r.id) : -1;
+        const float step = r.level >= 0 ? 0.01f : (gi >= 0 ? gains()->stepDb() / gains()->maxDb() : 0.01f);
+        set_row_level(r, row_level(r) + (float)d * step);
+    }
+    paint_row(s_focus);
+}
+
+void root_click_cb(lv_event_t*)
+{
+    lv_indev_t* in = lv_indev_active();
+    if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_ENCODER) return;
+    if (s_page == kPresets) {
+        do_softkey(0);                             // a click loads the selection
+        return;
+    }
+    if (s_focus + 1 < s_nvis) { focus_row(s_focus + 1, true); return; }
+    s_page = (Page)((s_page + 1) % kPages);
+    s_focus = 0;
+    build_section();
+}
+
+// ── building a section ─────────────────────────────────────────────────────
+
+lv_obj_t* row_base(int vi, lv_color_t stripe, const char* name, lv_obj_t** nameOut, lv_obj_t** subOut)
+{
+    lv_obj_t* b = plain(s_list, 0, vi * kRowStep, kRowW, kRowH, 6, kRowBg);
+    lv_obj_set_style_clip_corner(b, true, 0);
+    lv_obj_set_style_border_color(b, kAccent, 0);
+    plain(b, 0, 0, 4, kRowH, 0, stripe);
+    lv_obj_t* n = text(b, &lv_font_montserrat_14, kText, 12, 7, name);
+    lv_obj_set_width(n, 72);
+    lv_label_set_long_mode(n, LV_LABEL_LONG_CLIP);
+    lv_obj_t* s = text(b, &lv_font_montserrat_10, kDim, 12, 26, "");
+    lv_obj_set_width(s, 72);
+    lv_label_set_long_mode(s, LV_LABEL_LONG_CLIP);
+    if (nameOut) *nameOut = n;
+    if (subOut) *subOut = s;
+    s_visRow[vi] = b;
+    return b;
+}
+
+void build_fader_row(int vi, Row& r)
+{
+    lv_obj_t* b = row_base(vi, row_color(r), row_name(r), &r.name, &r.sub);
+    r.box = b;
+    /* The name opens the rest of the channel (its sends, its tone). */
+    lv_obj_t* hit = plain(b, 0, 0, kZoneX, kRowH, 0, kRowBg, LV_OPA_TRANSP);
+    lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hit, row_name_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)vi);
+
+    r.zone = plain(b, kZoneX, 0, kZoneW, kRowH, 0, kRowBg, LV_OPA_TRANSP);
+    lv_obj_add_flag(r.zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(r.zone, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    for (lv_event_code_t c : {LV_EVENT_PRESSED, LV_EVENT_PRESSING, LV_EVENT_RELEASED, LV_EVENT_PRESS_LOST}) {
+        lv_obj_add_event_cb(r.zone, zone_cb, c, (void*)(intptr_t)vi);
+    }
+    plain(r.zone, 0, 18, kZoneW, 4, 2, kWell);
+    r.meter = plain(r.zone, 0, 18, 0, 4, 2, kWave);
+    lv_obj_set_style_bg_grad_color(r.meter, kMute, 0);
+    lv_obj_set_style_bg_grad_dir(r.meter, LV_GRAD_DIR_HOR, 0);
+    lv_obj_set_style_bg_main_stop(r.meter, 170, 0);
+    lv_obj_set_style_bg_grad_stop(r.meter, 255, 0);
+    r.peakMark = plain(r.zone, 0, 15, 2, 10, 0, kText);
+    r.center = plain(r.zone, kZoneW / 2 - 1, 13, 2, 14, 1, kDim);
+    r.fill = plain(r.zone, 0, 18, 0, 4, 2, row_color(r));
+    r.knob = plain(r.zone, 0, 6, 12, 28, 4, kKnob);
+    lv_obj_set_style_shadow_width(r.knob, 3, 0);
+    lv_obj_set_style_shadow_opa(r.knob, LV_OPA_50, 0);
+    lv_obj_set_style_shadow_offset_y(r.knob, 1, 0);
+    r.val = text(r.zone, &lv_font_montserrat_10, kDim, 0, 31, "");
+
+    /* IN: MON, and the socket where the input has a choice of them;
+     * SOURCES: M S; OUT: M and the limiter's light. */
+    const char* k0 = s_page == kIn ? "MON" : "M";
+    const char* k1 = s_page == kSources ? "S" : (s_page == kOut ? "LIM" : nullptr);
+    if (s_page == kIn && r.src >= 0) k1 = gains()->sourceName(gain_input_of(r.id), r.src);
+    r.k[0] = key(b, kTogX, 4, kTogW, 36, k0, tog_cb, (void*)(uintptr_t)(vi | (0 << 8)));
+    r.k[1] = k1 ? key(b, kTogX + kTogStep, 4, kTogW, 36, k1, s_page == kOut ? nullptr : tog_cb,
+                      (void*)(uintptr_t)(vi | (1 << 8)))
+                : nullptr;
+}
+
+void build_route_row(int vi, uint8_t ch)
+{
+    auto& m = getMixerEngine();
+    const Look* look = look_for(m.getChannelName(ch));
+    const lv_color_t col = look && look->page == kIn ? kSky : (look ? lv_color_hex(look->color) : kText);
+    lv_obj_t* b = row_base(vi, col, look ? look->label : m.getChannelName(ch), nullptr, &s_rowSub[vi]);
+    const int n = m.numOutputs() < kMixerMaxOutputs ? m.numOutputs() : kMixerMaxOutputs;
+    const int32_t w = (kRowW - kZoneX - 4 - (n - 1) * 4) / (n ? n : 1);
+    for (int o = 0; o < n; ++o) {
+        char name[8];
+        short_output_name(name, sizeof(name), (uint8_t)o);
+        s_chips[vi][o] = key(b, kZoneX + o * (w + 4), 4, w, 36, name, chip_cb,
+                             (void*)(uintptr_t)(vi | (o << 8)));
+    }
+}
+
+void build_preset_row(int vi)
+{
+    const auto& i = crosspad::getMixerPresets().info(vi);
+    lv_obj_t* b = plain(s_list, 0, vi * kRowStep, kRowW, kRowH, 6, kWell);
+    lv_obj_set_style_border_color(b, kTeal, 0);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b, preset_row_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)vi);
+    plain(b, 4, 12, 3, 20, 2, kAccent, i.kind == crosspad::MixerPresets::Kind::Saved ? LV_OPA_COVER : LV_OPA_30);
+    text(b, &lv_font_montserrat_16, kText, 14, 6, i.name.c_str());
+    s_rowSub[vi] = text(b, &lv_font_montserrat_10, kDim, 14, 27,
+                        i.kind == crosspad::MixerPresets::Kind::Saved   ? "saved"
+                        : i.kind == crosspad::MixerPresets::Kind::Factory ? "starting point"
+                                                                          : "empty -- SAVE AS puts the desk here");
+    lv_obj_set_width(s_rowSub[vi], 230);
+    lv_label_set_long_mode(s_rowSub[vi], LV_LABEL_LONG_DOT);
+    s_rowTag[vi] = text(b, &lv_font_montserrat_10, kAccent, 0, 0, "LOADED");
+    lv_obj_align(s_rowTag[vi], LV_ALIGN_RIGHT_MID, -12, 0);
+    s_visRow[vi] = b;
+}
+
+void build_section()
+{
+    for (auto& r : s_rows) {
+        r.box = r.name = r.sub = r.zone = r.fill = r.center = r.meter = r.peakMark = r.knob = r.val = nullptr;
+        r.k[0] = r.k[1] = nullptr;
+    }
+    for (auto& v : s_visRow) v = nullptr;
+    for (auto& v : s_rowSub) v = nullptr;
+    for (auto& v : s_rowTag) v = nullptr;
+    for (auto& row : s_chips) for (auto& c : row) c = nullptr;
+    lv_obj_clean(s_list);
+    lv_obj_scroll_to_y(s_list, 0, LV_ANIM_OFF);
+    s_nvis = 0;
+
+    if (fader_page(s_page)) {
+        for (int i = 0; i < s_rowCount && s_nvis < kVisMax; ++i) {
+            if (s_rows[i].page != s_page) continue;
+            s_vis[s_nvis] = i;
+            build_fader_row(s_nvis, s_rows[i]);
+            ++s_nvis;
+        }
+    } else if (s_page == kRoute) {
+        /* The sources first, then the inputs. */
+        for (Page want : {kSources, kIn}) {
+            for (int i = 0; i < s_sourceCount && s_nvis < kVisMax; ++i) {
+                const Look* look = look_for(getMixerEngine().getChannelName(s_sources[i]));
+                if ((look ? look->page : kSources) != want) continue;
+                s_vis[s_nvis] = s_sources[i];
+                build_route_row(s_nvis, s_sources[i]);
+                ++s_nvis;
+            }
+        }
+    } else {
+        auto& pr = crosspad::getMixerPresets();
+        pr.refresh();                            // the card is read when the list is shown
+        for (int s = 0; s < crosspad::MixerPresets::kSlots && s_nvis < kVisMax; ++s) {
+            s_vis[s_nvis] = s;
+            build_preset_row(s_nvis);
+            ++s_nvis;
+        }
+        s_focus = s_psel;
+    }
+    if (s_focus >= s_nvis) s_focus = 0;
+    paint_all();
+    if (s_nvis && s_visRow[s_focus]) lv_obj_scroll_to_view(s_visRow[s_focus], LV_ANIM_OFF);
+}
+
 // ── the tick ───────────────────────────────────────────────────────────────
 
-void tick_row(Row& r, bool anySolo)
-{
-    auto& m = getMixerEngine();
-    float l = 0.0f, rr = 0.0f, gain = 0.0f;
-    bool muted = false;
-    int level = -1;              // a speaker's or a jack's, 0..100
-    char buf[24];
-    if (r.level >= 0) {
-        crosspad::IOutputLevels* ol = output_levels();
-        level = ol->level(r.level);
-        muted = ol->muted(r.level);
-        if (!muted) m.getOutputLevel(r.id, l, rr);   // the bus at unity: what it plays
-    } else if (r.output) {
-        m.getOutputLevel(r.id, l, rr);        // already post-master
-        gain = m.getOutputVolume(r.id);
-        muted = m.isOutputMuted(r.id);
-    } else if (r.src >= 0 && live_src_of(r.id) != r.src) {
-        /* Not the socket the converter is on: no signal can reach this row,
-         * so it shows none rather than mirroring its twin. */
-        l = rr = 0.0f;
-        gain = m.getChannelVolume(r.id);
-        muted = true;
-    } else {
-        m.getChannelLevel(r.id, l, rr);       // pre-fader: fader it here
-        gain = m.getChannelVolume(r.id);
-        muted = m.isChannelMuted(r.id);
-        const bool soloed = m.isChannelSoloed(r.id);
-        const float scale = (muted || (anySolo && !soloed)) ? 0.0f : gain;
-        l *= scale;
-        rr *= scale;
-        paint(r.solo, soloed, kSolo);
-        if (r.mon) {
-            /* Lit while the input is heard anywhere; the caption dim when not. */
-            const uint32_t mask = monitor_mask(r.id);
-            monitor_text(buf, sizeof(buf), mask);
-            lv_obj_t* cap = lv_obj_get_child(r.mon, 0);
-            lv_obj_t* val = lv_obj_get_child(r.mon, 1);
-            set_text(val, buf);
-            const lv_color_t bg = mask ? kAccent : kTrack;
-            const lv_color_t capInk = mask ? kInk : kDim, valInk = mask ? kInk : kText;
-            if (!lv_color_eq(lv_obj_get_style_bg_color(r.mon, LV_PART_MAIN), bg)) lv_obj_set_style_bg_color(r.mon, bg, 0);
-            if (!lv_color_eq(lv_obj_get_style_text_color(cap, LV_PART_MAIN), capInk)) lv_obj_set_style_text_color(cap, capInk, 0);
-            if (!lv_color_eq(lv_obj_get_style_text_color(val, LV_PART_MAIN), valInk)) lv_obj_set_style_text_color(val, valInk, 0);
-        }
-        const int gi = gain_input_of(r.id);
-        const bool live = connected(r.id);
-        if (!live)        std::snprintf(buf, sizeof(buf), "not in pair");
-        else if (gi >= 0) std::snprintf(buf, sizeof(buf), "gain +%.0f dB", (double)gains()->gainDb(gi));
-        else              pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
-        set_text(r.sub, buf);
-        dim(r.box, !live);
-    }
-    paint(r.mute, muted, kMute);
-    if (!held(r.fader)) {
-        const int32_t v = level >= 0 ? level : gain_to_fader(gain);
-        if (lv_slider_get_value(r.fader) != v) lv_slider_set_value(r.fader, v, LV_ANIM_OFF);
-        if (level >= 0) std::snprintf(buf, sizeof(buf), "%d", level);
-        else            db_text(buf, sizeof(buf), gain);
-        set_text(r.db, buf);
-    }
-    /* Fast up, slow down, the way a meter is read. */
-    const float peak = l > rr ? l : rr;
-    r.shown = peak > r.shown ? peak : r.shown * 0.82f;
-    const int32_t pos = peak_to_meter(r.shown);
-    if (lv_bar_get_value(r.meter) != pos) lv_bar_set_value(r.meter, pos, LV_ANIM_OFF);
-    const lv_color_t c = pos > 95 ? kMeterClip : (pos > 80 ? kMeterHi : kMeterOk);
-    if (!lv_color_eq(lv_obj_get_style_bg_color(r.meter, LV_PART_INDICATOR), c)) {
-        lv_obj_set_style_bg_color(r.meter, c, LV_PART_INDICATOR);
-    }
-}
-
-void send_label(int row, int o)
-{
-    auto& m = getMixerEngine();
-    lv_obj_t* l = s_sendLabels[row][o];
-    if (!l) return;
-    char buf[8];
-    const uint8_t ch = s_sources[row];
-    if (!m.isRouteEnabled(ch, o)) std::snprintf(buf, sizeof(buf), "off");
-    else std::snprintf(buf, sizeof(buf), "%d", (int)lroundf(m.getRouteVolume(ch, o) * 100.0f));
-    set_text(l, buf);
-}
-
+/// Meters and the limiter's light, and every value from the engine: anything
+/// else that moves the mix (HIL, a loaded desk) shows up here.
 void tick_cb(lv_timer_t*)
 {
     auto& m = getMixerEngine();
-    const bool anySolo = m.isAnySoloed();
-    if (s_page != kRoute) {
-        for (int i = 0; i < s_rowCount; ++i) if (s_rows[i].page == s_page) tick_row(s_rows[i], anySolo);
-        if (s_page == kIn && input_pairs()) {
-            const int cur = input_pairs()->pair();
-            for (int i = 0; i < kMaxPairs; ++i) paint(s_pairs[i], i == cur, kAccent);
-        }
-    } else {
-        for (int row = 0; row < s_sourceCount; ++row) {
-            dim(s_routeRows[row], !connected(s_sources[row]));
-            for (int o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
-                lv_obj_t* sl = s_sends[row][o];
-                if (!sl || held(sl)) continue;
-                const uint8_t ch = s_sources[row];
-                const int32_t v = m.isRouteEnabled(ch, o) ? (int32_t)lroundf(m.getRouteVolume(ch, o) * 100.0f) : 0;
-                if (lv_slider_get_value(sl) != v) lv_slider_set_value(sl, v, LV_ANIM_OFF);
-                send_label(row, o);
+    if (fader_page(s_page)) {
+        for (int vi = 0; vi < s_nvis; ++vi) {
+            Row& r = s_rows[s_vis[vi]];
+            float l = 0.0f, rr = 0.0f;
+            if (r.output || r.level >= 0) {
+                m.getOutputLevel(r.id, l, rr);
+                if (m.takeOutputLimit(r.id) < 0.99f) r.limitLit = 20;   // a second at 50 ms
+                else if (r.limitLit) --r.limitLit;
+            } else if (!socket_idle(r)) {
+                m.getChannelLevel(r.id, l, rr);
             }
+            const float peak = l > rr ? l : rr;
+            /* Fast up, slow down, the way a meter is read; the peak mark
+             * holds and falls slower. */
+            r.shown = peak > r.shown ? peak : r.shown * 0.82f;
+            r.peakHold = peak > r.peakHold ? peak : r.peakHold * 0.95f;
+            if (r.meter && !lv_obj_has_flag(r.meter, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_set_width(r.meter, peak_to_meter(r.shown) * kZoneW / 100);
+                lv_obj_set_x(r.peakMark, peak_to_meter(r.peakHold) * kZoneW / 100 - 1);
+            }
+            paint_fader_row(vi);
         }
+    } else if (s_page == kRoute) {
+        for (int vi = 0; vi < s_nvis; ++vi) paint_route_row(vi);
     }
     if (s_detail) detail_labels();
-}
-
-// ── building ───────────────────────────────────────────────────────────────
-
-void build_row(lv_obj_t* page, int idx, bool output, uint8_t id, Page where, int8_t src = -1,
-               int8_t level = -1)
-{
-    auto& m = getMixerEngine();
-    Row& r = s_rows[idx];
-    r = Row{};
-    r.output = output;
-    r.id = id;
-    r.page = where;
-    r.src = src;
-    r.level = level;
-
-    const Look* look = output ? nullptr : look_for(m.getChannelName(id));
-    const char* label = output ? m.getOutputName(id) : (look ? look->label : m.getChannelName(id));
-    if (src >= 0) label = gains() ? gains()->sourceName(gain_input_of(id), src) : "Line";
-    if (level >= 0) label = output_levels()->name(level);
-    const lv_color_t color = output ? kText : (look ? lv_color_hex(look->color) : kText);
-
-    r.box = make_box(page);
-    lv_obj_set_size(r.box, LV_PCT(100), kRowH);
-    lv_obj_set_style_bg_color(r.box, kRowBg, 0);
-    lv_obj_set_style_bg_opa(r.box, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(r.box, 6, 0);
-    lv_obj_set_style_border_width(r.box, 4, 0);
-    lv_obj_set_style_border_side(r.box, LV_BORDER_SIDE_LEFT, 0);
-    lv_obj_set_style_border_color(r.box, color, 0);
-    lv_obj_set_style_pad_hor(r.box, 4, 0);
-    lv_obj_set_style_pad_column(r.box, 4, 0);
-    lv_obj_set_flex_flow(r.box, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(r.box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    /* The name, and under it what the row does not show: gain or pan. A tap
-     * opens the rest of the channel. */
-    r.name = lv_button_create(r.box);
-    lv_obj_remove_style_all(r.name);
-    lv_obj_set_size(r.name, 62, kRowH - 2);
-    lv_obj_set_style_radius(r.name, 4, 0);
-    lv_obj_set_style_outline_color(r.name, kFocus, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_outline_width(r.name, 2, LV_STATE_FOCUS_KEY);
-    lv_obj_set_flex_flow(r.name, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(r.name, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    /* An output opens its tone; a channel opens the rest of itself. The
-     * outputs that carry no EQ (a recording bus) open nothing. */
-    if (!output || id < kMixerEqOutputs) {
-        lv_obj_add_event_cb(r.name, name_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
-    }
-    lv_obj_t* nl = lv_label_create(r.name);
-    lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(nl, color, 0);
-    lv_label_set_long_mode(nl, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(nl, 62);
-    lv_label_set_text(nl, label);
-    r.sub = lv_label_create(r.name);
-    lv_obj_set_style_text_font(r.sub, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(r.sub, kDim, 0);
-    lv_label_set_text(r.sub, level >= 0 ? "" : output ? output_role(m.getOutputName(id)) : "");
-
-    /* The fader, long, with the post-fader meter under it. */
-    lv_obj_t* lane = make_box(r.box);
-    lv_obj_set_height(lane, kRowH - 4);
-    lv_obj_set_flex_grow(lane, 1);
-    lv_obj_set_style_pad_hor(lane, 10, 0);        // half the knob, so it stays in the row at the ends
-    lv_obj_set_flex_flow(lane, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(lane, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(lane, 5, 0);
-    r.fader = make_slider(lane, 0, level >= 0 ? 100 : kFaderMax, output ? kDim : color, fader_cb,
-                          (void*)(intptr_t)idx);
-    lv_obj_set_width(r.fader, LV_PCT(100));
-    r.meter = lv_bar_create(lane);
-    lv_obj_set_size(r.meter, LV_PCT(100), 3);
-    lv_bar_set_range(r.meter, 0, 100);
-    lv_obj_set_style_bg_color(r.meter, lv_color_hex(0x101214), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(r.meter, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(r.meter, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(r.meter, 1, LV_PART_INDICATOR);
-    lv_obj_set_style_anim_duration(r.meter, 0, 0);
-    lv_obj_remove_flag(r.meter, LV_OBJ_FLAG_CLICKABLE);
-
-    r.db = lv_label_create(r.box);
-    lv_obj_set_width(r.db, 36);
-    lv_obj_set_style_text_font(r.db, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(r.db, kText, 0);
-    lv_obj_set_style_text_align(r.db, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(r.db, "");
-
-    r.mute = make_button(r.box, 26, 24, "M", mute_cb, (void*)(intptr_t)idx);
-    if (!output && where == kIn) {
-        /* MON: a caption and where the input is heard, one under the other. */
-        r.mon = make_button(r.box, 44, 24, "MON", mon_cb, (void*)(intptr_t)idx, &lv_font_montserrat_10);
-        lv_obj_t* cap = lv_obj_get_child(r.mon, 0);
-        lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 0);
-        lv_obj_t* val = lv_label_create(r.mon);
-        lv_obj_set_style_text_font(val, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(val, kText, 0);
-        lv_label_set_text(val, "");
-        lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, 0);
-    } else if (!output) {
-        r.solo = make_button(r.box, 26, 24, "S", solo_cb, (void*)(intptr_t)idx);
-    } else {
-        lv_obj_t* gap = make_box(r.box);
-        lv_obj_set_size(gap, 26, 1);
-    }
-
-    /* The USB recording bus's gain belongs to Settings -> USB, which applies
-     * it at every boot: a fader here would be undone by the next one. It is
-     * shown, metered and mutable, not moved. */
-    if (output && std::strcmp(m.getOutputName(id), "USB rec") == 0) {
-        lv_obj_add_state(r.fader, LV_STATE_DISABLED);
-        lv_obj_set_style_bg_color(r.fader, kDim, (lv_style_selector_t)LV_PART_KNOB | LV_STATE_DISABLED);
-        set_text(r.sub, "Settings");
-    }
-}
-
-lv_obj_t* make_page(lv_obj_t* parent)
-{
-    lv_obj_t* p = lv_obj_create(parent);
-    lv_obj_remove_style_all(p);
-    lv_obj_set_width(p, LV_PCT(100));
-    lv_obj_set_flex_grow(p, 1);
-    lv_obj_set_flex_flow(p, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(p, 3, 0);
-    lv_obj_set_scroll_dir(p, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_ACTIVE);
-    return p;
-}
-
-void build_route(lv_obj_t* page)
-{
-    auto& m = getMixerEngine();
-    const int outs = m.numOutputs() < kMixerMaxOutputs ? m.numOutputs() : kMixerMaxOutputs;
-    constexpr int32_t kNameW = 62;
-
-    lv_obj_t* head = make_box(page);
-    lv_obj_set_size(head, LV_PCT(100), 16);
-    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(head, 4, 0);
-    lv_obj_set_style_pad_left(head, 8, 0);
-    lv_obj_t* corner = lv_label_create(head);
-    lv_obj_set_width(corner, kNameW);
-    lv_obj_set_style_text_font(corner, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(corner, kDim, 0);
-    lv_label_set_text(corner, "send to");
-    for (int o = 0; o < outs; ++o) {
-        lv_obj_t* h = lv_label_create(head);
-        lv_obj_set_flex_grow(h, 1);
-        lv_obj_set_style_text_font(h, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(h, kText, 0);
-        lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_text(h, m.getOutputName(o));
-    }
-
-    for (int row = 0; row < s_sourceCount; ++row) {
-        const uint8_t ch = s_sources[row];
-        const Look* look = look_for(m.getChannelName(ch));
-        const lv_color_t color = look ? lv_color_hex(look->color) : kText;
-
-        lv_obj_t* r = make_box(page);
-        s_routeRows[row] = r;
-        lv_obj_set_size(r, LV_PCT(100), kRowH);
-        lv_obj_set_style_bg_color(r, kRowBg, 0);
-        lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(r, 6, 0);
-        lv_obj_set_style_border_width(r, 4, 0);
-        lv_obj_set_style_border_side(r, LV_BORDER_SIDE_LEFT, 0);
-        lv_obj_set_style_border_color(r, color, 0);
-        lv_obj_set_style_pad_hor(r, 4, 0);
-        lv_obj_set_style_pad_column(r, 4, 0);
-        lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-        lv_obj_t* nl = lv_label_create(r);
-        lv_obj_set_width(nl, kNameW);
-        lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(nl, color, 0);
-        lv_label_set_long_mode(nl, LV_LABEL_LONG_CLIP);
-        lv_label_set_text(nl, look ? look->label : m.getChannelName(ch));
-
-        for (int o = 0; o < outs; ++o) {
-            lv_obj_t* cell = make_box(r);
-            lv_obj_set_height(cell, kRowH - 4);
-            lv_obj_set_flex_grow(cell, 1);
-            lv_obj_set_style_pad_hor(cell, 7, 0);
-            lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_flex_align(cell, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_set_style_pad_row(cell, 1, 0);
-            lv_obj_t* vl = lv_label_create(cell);
-            lv_obj_set_style_text_font(vl, &lv_font_montserrat_10, 0);
-            lv_obj_set_style_text_color(vl, kDim, 0);
-            s_sendLabels[row][o] = vl;
-            lv_obj_t* sl = make_slider(cell, 0, 100, color, [](lv_event_t* e) {
-                const int packed = (int)(intptr_t)lv_event_get_user_data(e);
-                const int row = packed >> 4, o = packed & 0x0F;
-                set_send(s_sources[row], o, lv_slider_get_value(s_sends[row][o]));
-                send_label(row, o);
-            }, (void*)(intptr_t)((row << 4) | o));
-            lv_obj_set_width(sl, LV_PCT(100));
-            lv_obj_set_height(sl, 6);
-            lv_obj_set_style_pad_ver(sl, 6, LV_PART_KNOB);
-            s_sends[row][o] = sl;
-        }
-    }
-}
-
-/// IN's first row: which inputs the ADCs hear, where the board has to choose.
-void build_pairs(lv_obj_t* page)
-{
-    auto* p = input_pairs();
-    if (!p || p->pairs() < 2) return;
-    lv_obj_t* bar = make_box(page);
-    lv_obj_set_size(bar, LV_PCT(100), 26);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(bar, 4, 0);
-    for (int i = 0; i < p->pairs() && i < kMaxPairs; ++i) {
-        s_pairs[i] = make_button(bar, 10, 26, p->pairName(i), [](lv_event_t* e) {
-            if (auto* ip = input_pairs()) ip->setPair((int)(intptr_t)lv_event_get_user_data(e));
-        }, (void*)(intptr_t)i);
-        lv_obj_set_flex_grow(s_pairs[i], 1);
-    }
 }
 
 } // namespace
 
 lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
 {
-#ifdef MIXER_USE_ENCODER
-    if (indev_encoderTop) s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
-    if (!s_encGroup) s_encGroup = lv_group_create();
-    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_encGroup);
-#endif
     auto& m = getMixerEngine();
 
-    s_root = lv_obj_create(parent);
+    s_root = lv_CreateEditableButton(parent);
+    lv_obj_remove_style_all(s_root);
     lv_obj_set_size(s_root, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(s_root, kBg, 0);
-    lv_obj_set_style_border_width(s_root, 0, 0);
-    lv_obj_set_style_radius(s_root, 0, 0);
-    lv_obj_set_style_pad_all(s_root, 4, 0);
-    lv_obj_set_style_pad_row(s_root, 4, 0);
-    lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_root, root_key_cb, LV_EVENT_KEY, nullptr);
+    lv_obj_add_event_cb(s_root, root_click_cb, LV_EVENT_CLICKED, nullptr);
 
-    for (int p = 0; p < kPages; ++p) s_pages[p] = make_page(s_root);
-    build_pairs(s_pages[kIn]);
+    for (int t = 0; t < kPages; ++t) {
+        s_tabs[t] = key(s_root, 4 + t * kTabStep, kTabY, kTabW, kTabH, kTabNames[t], tab_cb, (void*)(intptr_t)t);
+        lv_obj_set_style_text_font(lv_obj_get_child(s_tabs[t], 0),
+                                   std::strlen(kTabNames[t]) > 5 ? &lv_font_montserrat_10 : &lv_font_montserrat_14, 0);
+    }
+    s_list = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_list);
+    lv_obj_set_pos(s_list, 4, kListY);
+    lv_obj_set_size(s_list, kRowW, kListH);
+    lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_snap_y(s_list, LV_SCROLL_SNAP_START);
+    /* A fade along the list's bottom: rows scroll on under it. */
+    lv_obj_t* fade = plain(s_root, 0, kListY + kListH - 14, 320, 14, 0, kBg);
+    lv_obj_set_style_bg_main_opa(fade, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_grad_color(fade, kBg, 0);
+    lv_obj_set_style_bg_grad_opa(fade, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_grad_dir(fade, LV_GRAD_DIR_VER, 0);
+    for (int k = 0; k < kKeys; ++k) s_keys[k] = key(s_root, 4, kKeyY, 100, kKeyH, "", softkey_cb, (void*)(intptr_t)k);
 
-    /* Channels onto their pages in the order kLooks gives them -- Mic, the
-     * lines, USB in; Sampler first among the sources -- not the order they were
-     * added in; one the table does not know goes last. Outputs onto OUT. */
+    /* The channels in the order kLooks gives them -- the inputs, then the
+     * Sampler first among the sources -- not the order they were added in;
+     * one the table does not know goes last. */
     s_rowCount = 0;
     s_sourceCount = 0;
+    auto add_row = [&](bool output, uint8_t id, Page where, int8_t src, int8_t level) {
+        Row& r = s_rows[s_rowCount++];
+        r = Row{};
+        r.output = output;
+        r.id = id;
+        r.page = where;
+        r.src = src;
+        r.level = level;
+    };
     auto place = [&](uint8_t ch) {
         const Look* look = look_for(m.getChannelName(ch));
         const Page where = look ? look->page : kSources;
@@ -1445,11 +1606,9 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
         const int gi = gain_input_of(ch);
         const int sockets = (gi >= 0 && gains()) ? gains()->sources(gi) : 0;
         if (sockets >= 2) {
-            for (int k = 0; k < sockets && s_rowCount < kMaxRows; ++k) {
-                build_row(s_pages[where], s_rowCount++, false, ch, where, (int8_t)k);
-            }
+            for (int k = 0; k < sockets && s_rowCount < kMaxRows; ++k) add_row(false, ch, where, (int8_t)k, -1);
         } else {
-            build_row(s_pages[where], s_rowCount++, false, ch, where);
+            add_row(false, ch, where, -1, -1);
         }
         s_sources[s_sourceCount++] = ch;
     };
@@ -1465,62 +1624,34 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
      * unity) is shown as what it plays through: a row per speaker or jack. */
     crosspad::IOutputLevels* ol = output_levels();
     for (uint8_t o = 0; o < m.numOutputs() && s_rowCount < kMaxRows; ++o) {
-        int heard = 0;
-        for (int i = 0; ol && i < ol->outputs(); ++i) {
-            heard += std::strcmp(ol->mixerOutput(i), m.getOutputName(o)) == 0;
+        bool hw = false;
+        if (ol && m.isOutputUnity(o)) {
+            for (int i = 0; i < ol->outputs() && s_rowCount < kMaxRows; ++i) {
+                if (std::strcmp(ol->mixerOutput(i), m.getOutputName(o)) != 0) continue;
+                add_row(true, o, kOut, -1, (int8_t)i);
+                hw = true;
+            }
         }
-        if (!heard || !m.isOutputUnity(o)) {
-            build_row(s_pages[kOut], s_rowCount++, true, o, kOut);
-            continue;
-        }
-        /* Two or more on one bus: held together by a bracket down their left,
-         * one stream at a level each. */
-        lv_obj_t* parent = s_pages[kOut];
-        if (heard > 1) {
-            const int32_t gap = lv_obj_get_style_pad_row(s_pages[kOut], LV_PART_MAIN);
-            lv_obj_t* group = make_box(s_pages[kOut]);
-            lv_obj_set_size(group, LV_PCT(100), LV_SIZE_CONTENT);
-            lv_obj_set_flex_flow(group, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(group, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_set_style_pad_column(group, 3, 0);
-            lv_obj_t* bracket = make_box(group);
-            lv_obj_set_size(bracket, 4, heard * kRowH + (heard - 1) * gap - 8);
-            lv_obj_set_style_bg_color(bracket, kAccent, 0);
-            lv_obj_set_style_bg_opa(bracket, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(bracket, 2, 0);
-            parent = make_box(group);
-            lv_obj_set_height(parent, LV_SIZE_CONTENT);
-            lv_obj_set_flex_grow(parent, 1);
-            lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_style_pad_row(parent, gap, 0);
-        }
-        for (int i = 0; i < ol->outputs() && s_rowCount < kMaxRows; ++i) {
-            if (std::strcmp(ol->mixerOutput(i), m.getOutputName(o)) != 0) continue;
-            build_row(parent, s_rowCount++, true, o, kOut, -1, (int8_t)i);
-        }
-    }
-    build_route(s_pages[kRoute]);
-    build_presets(s_pages[kPresets]);
-
-    /* The categories, along the bottom where the thumb is. */
-    lv_obj_t* tabs = make_box(s_root);
-    lv_obj_set_size(tabs, LV_PCT(100), kTabH);
-    lv_obj_set_flex_flow(tabs, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(tabs, 4, 0);
-    s_back = make_button(tabs, 36, kTabH, LV_SYMBOL_LEFT, back_cb, app);
-    /* Shared out by how long the names are, so SOURCES and ROUTE fit. */
-    static const uint8_t kTabGrow[kPages] = {2, 3, 2, 3, 0};
-    for (int p = 0; p < kPages; ++p) {
-        s_tabs[p] = make_button(tabs, 36, kTabH, kPageNames[p], tab_cb, (void*)(intptr_t)p);
-        lv_obj_set_flex_grow(s_tabs[p], kTabGrow[p]);
+        if (!hw) add_row(true, o, kOut, -1, -1);
     }
 
-    show_page(kSources);
-    tick_cb(nullptr);
-#ifdef MIXER_USE_ENCODER
-    if (s_encGroup) lv_group_focus_obj(s_tabs[kSources]);
-#endif
+    s_page = kSources;
+    s_focus = 0;
+    s_psel = 0;
+    build_section();
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
+
+#ifdef MIXER_USE_ENCODER
+    /* The desk takes the encoder in edit mode: a turn moves the focused
+     * row's value, a click the focus. A long press lets go -- the transport
+     * bar's keys are one turn on. */
+    if (indev_encoderTop) s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
+    if (!s_encGroup) s_encGroup = lv_group_create();
+    lv_group_add_obj(s_encGroup, s_root);
+    lv_group_focus_obj(s_root);
+    lv_group_set_editing(s_encGroup, true);
+    if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_encGroup);
+#endif
 
     if (app) {
         app->setOnBack(back_handler);
@@ -1557,8 +1688,6 @@ void Mixer_destroy(lv_obj_t* app_obj)
 #endif
     s_nameOv = s_nameText = nullptr;
     s_nameSlot = -1;
-    for (auto& r : s_pre) r = PresetRow{};
-    s_preStatus = s_preUndo = nullptr;
     s_detail = s_dGain = s_dGainLabel = s_dPan = s_dPanLabel = nullptr;
     for (auto& o : s_dEq) o = nullptr;
     for (auto& o : s_dEqLabel) o = nullptr;
@@ -1567,14 +1696,14 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& s : s_dMon) s = nullptr;
     s_detailRow = s_gainInput = -1;
     for (auto& r : s_rows) r = Row{};
-    for (auto& row : s_sends) for (auto& c : row) c = nullptr;
-    for (auto& row : s_sendLabels) for (auto& c : row) c = nullptr;
-    for (auto& r : s_routeRows) r = nullptr;
-    for (auto& b : s_pairs) b = nullptr;
-    for (auto& p : s_pages) p = nullptr;
+    for (auto& v : s_visRow) v = nullptr;
+    for (auto& v : s_rowSub) v = nullptr;
+    for (auto& v : s_rowTag) v = nullptr;
+    for (auto& row : s_chips) for (auto& c : row) c = nullptr;
     for (auto& t : s_tabs) t = nullptr;
-    s_rowCount = s_sourceCount = 0;
-    s_root = s_back = nullptr;
+    for (auto& k : s_keys) k = nullptr;
+    s_rowCount = s_sourceCount = s_nvis = 0;
+    s_root = s_list = nullptr;
 
 #ifdef MIXER_USE_ENCODER
     if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
@@ -1585,7 +1714,7 @@ void Mixer_destroy(lv_obj_t* app_obj)
     s_prevEncGroup = nullptr;
 #endif
 
-    lv_obj_delete_async(app_obj);
+    if (app_obj) lv_obj_delete_async(app_obj);
 }
 
 // No pad logic: the pads keep playing the kit, so the mix is heard as it moves.
