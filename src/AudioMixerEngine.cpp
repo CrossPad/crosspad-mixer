@@ -528,6 +528,7 @@ CP_COLD void AudioMixerEngine::profEnable(bool on)
 {
     profPasses_.store(0, std::memory_order_relaxed);
     for (auto& n : profNode_) n.store(0, std::memory_order_relaxed);
+    for (auto& n : profNodeMax_) n.store(0, std::memory_order_relaxed);
     profPeak_.store(0, std::memory_order_relaxed);
     profClear_.store(0, std::memory_order_relaxed);
     profRoute_.store(0, std::memory_order_relaxed);
@@ -555,11 +556,15 @@ CP_COLD void AudioMixerEngine::profRead(char* out, uint32_t cap, float cpuMhz)
                           prof_.load(std::memory_order_relaxed) ? 1 : 0, (unsigned)n,
                           pk / 10, pk % 10, cl / 10, cl % 10, ro / 10, ro % 10, ou / 10, ou % 10);
     /* Only the channels that cost something: sixteen "ch3=0.0" would push the
-     * interesting ones off a 192-byte reply. */
+     * interesting ones off a 192-byte reply. Each is its average pass and,
+     * after the slash, its longest: a spike shows which node made it. */
+    const uint64_t one = uint64_t(cpuMhz > 0 ? cpuMhz + 0.5f : 240.0f);
     for (uint8_t ch = 0; ch < kMixerMaxChannels && w > 0 && (uint32_t)w + 16 < cap; ++ch) {
         const unsigned us = (tenths(profNode_[ch].exchange(0, std::memory_order_relaxed)) + 5) / 10;
+        const unsigned mx = (unsigned)((uint64_t(profNodeMax_[ch].exchange(0, std::memory_order_relaxed))
+                                        << kProfShift) / one);
         if (us < 1) continue;
-        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%u ", (unsigned)ch, us);
+        w += std::snprintf(out + w, cap - (uint32_t)w, "%u:%u/%u ", (unsigned)ch, us, mx);
     }
     if (w > 0 && (uint32_t)w + 3 < cap) std::snprintf(out + w, cap - (uint32_t)w, "\r\n");
 }
@@ -582,7 +587,11 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         std::memset(slot.scratch.data(), 0, stereo * sizeof(float));
         slot.node->mix(slot.scratch.data(), frames);
         const uint32_t c1 = prof ? cyc_() : 0;
-        if (prof) profNode_[ch].fetch_add(profUnits(c1 - c0), std::memory_order_relaxed);
+        if (prof) {
+            const uint32_t u = profUnits(c1 - c0);
+            profNode_[ch].fetch_add(u, std::memory_order_relaxed);
+            if (u > profNodeMax_[ch].load(std::memory_order_relaxed)) profNodeMax_[ch].store(u, std::memory_order_relaxed);
+        }
 
         float pL = 0.0f, pR = 0.0f;
         crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);

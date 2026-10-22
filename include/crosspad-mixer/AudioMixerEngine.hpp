@@ -391,6 +391,7 @@ private:
     static constexpr uint32_t kProfShift = 4;
     static uint32_t profUnits(uint32_t cycles) { return (cycles + (1u << (kProfShift - 1))) >> kProfShift; }
     std::atomic<uint32_t> profNode_[kMixerMaxChannels] = {};
+    std::atomic<uint32_t> profNodeMax_[kMixerMaxChannels] = {};   // the longest pass of each, same units
     std::atomic<uint32_t> profPeak_{0}, profClear_{0}, profRoute_{0}, profOut_{0};
 
     StateChangedFn stateChangedCb_;
