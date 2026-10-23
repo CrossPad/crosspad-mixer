@@ -393,6 +393,32 @@ void AudioMixerEngine::renderTap(const ChannelId* chs, uint8_t n, float* out, ui
     limit(out, frames, kLimitCeiling, tapLimGain_, tapLimHold_, tapLimMin_, pL, pR);
 }
 
+void AudioMixerEngine::renderOnly(const ChannelId* chs, uint8_t n, uint32_t frames) {
+    const uint32_t stereo = frames * 2;
+    for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
+        bool wanted = false;
+        for (uint8_t i = 0; i < n && !wanted; ++i) wanted = chs[i] == ch;
+        if (!wanted) continue;
+        auto& slot = channels_[ch];
+        if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
+        if (slot.scratch.size() < stereo) continue;
+        std::memset(slot.scratch.data(), 0, stereo * sizeof(float));
+        slot.node->mix(slot.scratch.data(), frames);
+        float pL = 0.0f, pR = 0.0f;
+        crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
+        slot.peakL.store(pL, std::memory_order_relaxed);
+        slot.peakR.store(pR, std::memory_order_relaxed);
+        /* As render() pans a channel that sounded; one that did not stays the
+         * zeros it is, which renderTap() sums the same either way. */
+        const float pan = slot.pan.load(std::memory_order_relaxed);
+        if ((pL != 0.0f || pR != 0.0f) && pan != 0.0f) {
+            const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
+            const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
+            crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
+        }
+    }
+}
+
 void AudioMixerEngine::setOutputCeiling(OutputId out, float ceiling) {
     if (out >= kMixerMaxOutputs) return;
     if (ceiling > kLimitCeiling) ceiling = kLimitCeiling;

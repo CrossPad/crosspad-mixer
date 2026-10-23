@@ -226,6 +226,12 @@ public:
     /// must not decide, such as the pads alone for a bounce. Limited as an
     /// output is: a bounce of a dense part must not be a clipped file.
     void renderTap(const ChannelId* chs, uint8_t n, float* out, uint32_t frames);
+    /// RT, in place of render() while nothing is heard (an offline render, a
+    /// freeze faster than real time): only the channels in @p chs, in channel
+    /// order as render() takes them, each node pulled into its scratch, its
+    /// meter set and panned as render() leaves it -- and nothing sent to any
+    /// output. renderTap() then reads them as it would after render().
+    void renderOnly(const ChannelId* chs, uint8_t n, uint32_t frames);
 
     // ── Tap (CI/test capture) ──────────────────────────────────────────────
 
