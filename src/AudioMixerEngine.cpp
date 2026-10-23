@@ -407,7 +407,7 @@ void AudioMixerEngine::renderOnly(const ChannelId* chs, uint8_t n, uint32_t fram
         std::memset(slot.scratch.data(), 0, stereo * sizeof(float));
         slot.node->mix(slot.scratch.data(), frames);
         float pL = 0.0f, pR = 0.0f;
-        crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
+        if (!slot.node->lastMixSilent()) crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
         /* As render() pans a channel that sounded; one that did not stays the
@@ -622,7 +622,10 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         }
 
         float pL = 0.0f, pR = 0.0f;
-        crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
+        /* A node that says its block added nothing left the cleared scratch
+         * as it was: a peak of 0, no pass over it. An idle engine's channel
+         * was ~5 us of every block for nothing. */
+        if (!slot.node->lastMixSilent()) crosspad::dsp::peakStereo(slot.scratch.data(), frames, pL, pR);
         slot.peakL.store(pL, std::memory_order_relaxed);
         slot.peakR.store(pR, std::memory_order_relaxed);
         if (pL != 0.0f || pR != 0.0f) sounded |= 1u << ch;
