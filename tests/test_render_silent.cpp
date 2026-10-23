@@ -290,3 +290,42 @@ TEST_CASE("Mixer render: a block of nothing but NaN does not reach the buses",
         CHECK(sameBits(rig.bus[o], want.bus[o]));
     }
 }
+
+namespace {
+/* BlockNode that says so when its block added nothing (IAudioNode). */
+class SayingNode : public BlockNode {
+public:
+    bool lastMixSilent() const override { return !sounding; }
+};
+} // namespace
+
+TEST_CASE("Mixer render: a node that says its block was silent is metered and sent as a scan of it would be",
+          "[mixer][render]") {
+    BlockNode quiet[3];
+    SayingNode saying[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        fillNoise(quiet[i].block, 20 + i);
+        fillNoise(saying[i].block, 20 + i);
+    }
+    const float sends[3][kBuses] = {{1.0f, 0.5f, 0.0f}, {0.6f, 1.0f, 0.3f}, {0.0f, 0.8f, 1.0f}};
+    Rig a, b;
+    std::vector<AudioMixerEngine::ChannelId> ia, ib;
+    for (uint32_t i = 0; i < 3; ++i) {
+        ia.push_back(a.add({&quiet[i], 0.9f, 0.25f * static_cast<float>(i), {sends[i][0], sends[i][1], sends[i][2]}}));
+        ib.push_back(b.add({&saying[i], 0.9f, 0.25f * static_cast<float>(i), {sends[i][0], sends[i][1], sends[i][2]}}));
+    }
+    const char* const pattern[] = {"...", "1..", ".1.", "111", "...", "..1", "1.1"};
+    for (const char* who : pattern) {
+        for (uint32_t i = 0; i < 3; ++i) quiet[i].sounding = saying[i].sounding = who[i] == '1';
+        a.render();
+        b.render();
+        for (uint8_t o = 0; o < kBuses; ++o) REQUIRE(sameBits(a.bus[o], b.bus[o]));
+        for (uint32_t i = 0; i < 3; ++i) {
+            float al = -1, ar = -1, bl = -1, br = -1;
+            a.eng.getChannelLevel(ia[i], al, ar);
+            b.eng.getChannelLevel(ib[i], bl, br);
+            CHECK(al == bl);
+            CHECK(ar == br);
+        }
+    }
+}
