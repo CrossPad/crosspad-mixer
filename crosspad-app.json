@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.16.1: a channel slot gets its block of scratch when a channel is registered in it, not at setup() for all sixteen: with the scratch in internal RAM (core 2.15.0 AlignedVector) six unused slots were 3 kB of it.",
     "0.16.0: + renderOnly(): the channels asked for, pulled and panned as render() leaves them, nothing sent to an output -- for a render no one hears (a freeze faster than real time), which renderTap() then reads.",
     "0.15.1: MIXPROF gives each node's longest pass after its average (nodes=ch:avg/max): a spike says which node made it.",
     "0.15.0: the Mixer in the UX 2000 design, sized for a finger: five tabs -- IN (inputs: GAIN or PAN, MON to every output heard, a row per socket, PAIR where the board has more inputs than ADCs), SOURCES (LEVEL or PAN, M, S), OUT (the masters and every output with a level of its own: LEVEL, M, LIM lit while the limiter works), ROUTE (a chip per source and output, CLEAR, RESET) and PRESETS (the desk saved and loaded by name, UNDO) -- rows with a 152 px zone a finger drags and two keys, the rest of a channel (sends, monitor, pan, an output's tone) behind its name; the engine is the only state, so anything else that moves the mix shows up here.",

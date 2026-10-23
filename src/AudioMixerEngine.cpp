@@ -61,12 +61,14 @@ CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, u
 
     const uint32_t stereoSamples = frameCount * 2;
     for (auto& slot : channels_) {
+        /* Only a registered channel gets its block: addChannel() sizes the
+         * others' when they arrive. Sized up front, all kMixerMaxChannels of
+         * them took a block each of internal RAM for nothing (AlignedVector). */
+        if (!slot.active.load(std::memory_order_acquire)) continue;
         if (slot.scratch.size() < stereoSamples) slot.scratch.resize(stereoSamples);
         // Propagate the new buffer-size + SR to already-registered channel
         // nodes so they can pre-size their own scratch (RT-safe contract).
-        if (slot.active.load(std::memory_order_acquire) && slot.node) {
-            slot.node->onPrepare(frameCount, sampleRate);
-        }
+        if (slot.node) slot.node->onPrepare(frameCount, sampleRate);
     }
     for (auto& o : outputs_) {
         if (o.lookahead.load(std::memory_order_relaxed)) o.held.assign(stereoSamples, 0.0f);
