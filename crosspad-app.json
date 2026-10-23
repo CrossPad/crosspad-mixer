@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -11,10 +11,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.70.0,<3.0.0",
+    "crosspad-core": ">=2.16.0,<3.0.0",
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.17.0: a node that says its block added nothing (core 2.16.0 IAudioNode::lastMixSilent()) is metered as silent without a pass over its block -- in render() and renderOnly(); the buses and meters are the same to the bit. Requires core 2.16.",
     "0.16.1: a channel slot gets its block of scratch when a channel is registered in it, not at setup() for all sixteen: with the scratch in internal RAM (core 2.15.0 AlignedVector) six unused slots were 3 kB of it.",
     "0.16.0: + renderOnly(): the channels asked for, pulled and panned as render() leaves them, nothing sent to an output -- for a render no one hears (a freeze faster than real time), which renderTap() then reads.",
     "0.15.1: MIXPROF gives each node's longest pass after its average (nodes=ch:avg/max): a spike says which node made it.",
