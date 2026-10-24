@@ -154,6 +154,12 @@ public:
     /// song plays. 1 is none.
     void  setChannelTrim  (ChannelId ch, float gain);
     float getChannelTrim  (ChannelId ch) const;
+    /// The same for the channel's placement: a balance on top of its own pan
+    /// (-1 left .. +1 right, the side it moves away from turned down), never
+    /// saved -- an Arrange seq track's pan on its engine while the song
+    /// plays. 0 is none.
+    void  setChannelTrimPan(ChannelId ch, float pan);
+    float getChannelTrimPan(ChannelId ch) const;
     bool  isAnySoloed     () const;
 
     // ── Output bus control ─────────────────────────────────────────────────
@@ -320,6 +326,7 @@ private:
         std::atomic<bool>  muted{false};
         std::atomic<bool>  soloed{false};
         std::atomic<float> pan{0.0f};
+        std::atomic<float> trimPan{0.0f};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
 

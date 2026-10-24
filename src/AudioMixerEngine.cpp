@@ -48,6 +48,16 @@ static constexpr float kLimReleaseS = 0.2f;
  * 60 Hz + 7 kHz IMD -40 -> -57 dB. Longer than a 20 Hz period. */
 static constexpr float kLimHoldS = 0.05f;
 
+/// A channel's placement: its own pan and the trim pan another part of the
+/// instrument puts on it, each a balance -- the side it moves away from
+/// turned down -- multiplied. False when both are centred: nothing to scale.
+static inline bool pan_gains(float pan, float trimPan, float& gl, float& gr) {
+    if (pan == 0.0f && trimPan == 0.0f) return false;
+    gl = (pan > 0.0f ? 1.0f - pan : 1.0f) * (trimPan > 0.0f ? 1.0f - trimPan : 1.0f);
+    gr = (pan < 0.0f ? 1.0f + pan : 1.0f) * (trimPan < 0.0f ? 1.0f + trimPan : 1.0f);
+    return true;
+}
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, uint8_t numOutputs) {
@@ -261,6 +271,17 @@ float AudioMixerEngine::getChannelVolume(ChannelId ch) const {
     return channels_[ch].volume.load(std::memory_order_relaxed);
 }
 
+void AudioMixerEngine::setChannelTrimPan(ChannelId ch, float pan) {
+    if (ch >= kMixerMaxChannels) return;
+    if (pan < -1.0f) pan = -1.0f;
+    if (pan >  1.0f) pan =  1.0f;
+    channels_[ch].trimPan.store(pan, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getChannelTrimPan(ChannelId ch) const {
+    return ch < kMixerMaxChannels ? channels_[ch].trimPan.load(std::memory_order_relaxed) : 0.0f;
+}
+
 void AudioMixerEngine::setChannelTrim(ChannelId ch, float gain) {
     if (ch >= kMixerMaxChannels) return;
     channels_[ch].trim.store(gain < 0.0f ? 0.0f : gain, std::memory_order_relaxed);
@@ -412,10 +433,8 @@ void AudioMixerEngine::renderOnly(const ChannelId* chs, uint8_t n, uint32_t fram
         slot.peakR.store(pR, std::memory_order_relaxed);
         /* As render() pans a channel that sounded; one that did not stays the
          * zeros it is, which renderTap() sums the same either way. */
-        const float pan = slot.pan.load(std::memory_order_relaxed);
-        if ((pL != 0.0f || pR != 0.0f) && pan != 0.0f) {
-            const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
-            const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
+        float gl, gr;
+        if ((pL != 0.0f || pR != 0.0f) && pan_gains(slot.pan.load(std::memory_order_relaxed), slot.trimPan.load(std::memory_order_relaxed), gl, gr)) {
             crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
         }
     }
@@ -676,10 +695,8 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         /* Pan once, in the channel's own scratch, before it is sent anywhere:
          * every send then carries the same placement, as on a desk. After the
          * meter above, which stays pre-fader and pre-pan. */
-        const float pan = slot.pan.load(std::memory_order_relaxed);
-        if (pan != 0.0f) {
-            const float gl = pan > 0.0f ? 1.0f - pan : 1.0f;
-            const float gr = pan < 0.0f ? 1.0f + pan : 1.0f;
+        float gl, gr;
+        if (pan_gains(slot.pan.load(std::memory_order_relaxed), slot.trimPan.load(std::memory_order_relaxed), gl, gr)) {
             crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
         }
 
