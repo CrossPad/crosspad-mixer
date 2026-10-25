@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.18.0: setChannelTrimPan() -- a balance on top of a channel's own pan, never saved with the desk, as setChannelTrim() is to its fader: what an Arrange seq track's pan puts on the engine its notes play through while the song plays; the two multiply",
     "0.17.0: a node that says its block added nothing (core 2.16.0 IAudioNode::lastMixSilent()) is metered as silent without a pass over its block -- in render() and renderOnly(); the buses and meters are the same to the bit. Requires core 2.16.",
     "0.16.1: a channel slot gets its block of scratch when a channel is registered in it, not at setup() for all sixteen: with the scratch in internal RAM (core 2.15.0 AlignedVector) six unused slots were 3 kB of it.",
     "0.16.0: + renderOnly(): the channels asked for, pulled and panned as render() leaves them, nothing sent to an output -- for a render no one hears (a freeze faster than real time), which renderTap() then reads.",
@@ -40,7 +41,7 @@
     "0.5.0 (0.4.1 merged in: builds on the PC against LVGL 9.4): MONITOR on every input (MON on its row, a Monitor row in its window): off, 1/2, 3/4 or both -- the outputs the engine marks heard; outputs named 1/2 (speakers) and 3/4 (phones); AudioMixerEngine::setOutputHeard/isOutputHeard",
     "0.4.0: IN / SOURCES / OUT / ROUTE tabs along the bottom, a row per channel with a long fader, the channel window (input gain, pan, sends); requires core 1.25 (IInputGain) and gui 1.14",
     "0.2.1: Merge lvgl.h include fix + PlatformIO library.json with MixerPadLogic registration",
-    "0.2.0: Dynamic IAudioNode-based channels (up to 16 \u00d7 8 outputs); ESP-IDF build target",
-    "0.1.0: Initial release \u2014 VU meters, 3x2 routing matrix, volume + mute/solo"
+    "0.2.0: Dynamic IAudioNode-based channels (up to 16 × 8 outputs); ESP-IDF build target",
+    "0.1.0: Initial release — VU meters, 3x2 routing matrix, volume + mute/solo"
   ]
 }
