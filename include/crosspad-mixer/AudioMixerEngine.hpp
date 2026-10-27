@@ -160,6 +160,11 @@ public:
     /// plays. 0 is none.
     void  setChannelTrimPan(ChannelId ch, float pan);
     float getChannelTrimPan(ChannelId ch) const;
+    /// The channel rendered, metered and on the tap (renderTap()), sent to
+    /// no output: what is being recorded and must not be heard -- a song's
+    /// freeze in real time. Never saved with the desk; off is none.
+    void  setChannelTapOnly(ChannelId ch, bool on);
+    bool  isChannelTapOnly (ChannelId ch) const;
     bool  isAnySoloed     () const;
 
     // ── Output bus control ─────────────────────────────────────────────────
@@ -327,6 +332,7 @@ private:
         std::atomic<bool>  soloed{false};
         std::atomic<float> pan{0.0f};
         std::atomic<float> trimPan{0.0f};
+        std::atomic<bool>  tapOnly{false};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
 
