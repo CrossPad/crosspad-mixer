@@ -282,6 +282,14 @@ float AudioMixerEngine::getChannelTrimPan(ChannelId ch) const {
     return ch < kMixerMaxChannels ? channels_[ch].trimPan.load(std::memory_order_relaxed) : 0.0f;
 }
 
+void AudioMixerEngine::setChannelTapOnly(ChannelId ch, bool on) {
+    if (ch < kMixerMaxChannels) channels_[ch].tapOnly.store(on, std::memory_order_relaxed);
+}
+
+bool AudioMixerEngine::isChannelTapOnly(ChannelId ch) const {
+    return ch < kMixerMaxChannels && channels_[ch].tapOnly.load(std::memory_order_relaxed);
+}
+
 void AudioMixerEngine::setChannelTrim(ChannelId ch, float gain) {
     if (ch >= kMixerMaxChannels) return;
     channels_[ch].trim.store(gain < 0.0f ? 0.0f : gain, std::memory_order_relaxed);
@@ -699,6 +707,9 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
         if (pan_gains(slot.pan.load(std::memory_order_relaxed), slot.trimPan.load(std::memory_order_relaxed), gl, gr)) {
             crosspad::dsp::scaleStereo(slot.scratch.data(), frames, gl, gr);
         }
+
+        /* Panned for the tap, which reads this scratch, and sent nowhere. */
+        if (slot.tapOnly.load(std::memory_order_relaxed)) continue;
 
         const float chVol = slot.volume.load(std::memory_order_relaxed) * slot.trim.load(std::memory_order_relaxed);
         const float* src = slot.scratch.data();
