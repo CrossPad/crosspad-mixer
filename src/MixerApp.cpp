@@ -6,7 +6,8 @@
  * section's rows under them, the soft keys along the bottom.
  *
  *   IN       what comes into the board: the mics, the line-in sockets, USB
- *            audio from the host. The zone is the input's GAIN (or PAN), MON
+ *            audio from the host. The zone is the channel's LEVEL (or PAN),
+ *            its gain under the name -- the name opens it to set --, MON
  *            sends it to every output you hear, and an input with a choice of
  *            sockets has a row per socket and a key that listens to it. Where
  *            the board has more inputs than ADCs, PAIR picks the two it hears;
@@ -22,7 +23,7 @@
  *
  * A row: its name, a 152 px zone a finger drags (level, or pan on the PAN
  * page; the meter in it on IN and OUT), the value under it, two keys. Tap
- * the name for the rest of the channel: its sends, monitor, pan -- an
+ * the name for the rest of the channel: an input's gain, its sends, monitor, pan -- an
  * output's tone. The encoder turns the focused row and clicks to the next
  * one, past the last to the next section.
  *
@@ -417,7 +418,7 @@ void detail_labels()
     }
     if (s_dGainLabel && gains() && s_gainInput >= 0) {
         const float db = gains()->gainDb(s_gainInput);
-        std::snprintf(buf, sizeof(buf), "Gain  +%.0f dB", (double)db);
+        std::snprintf(buf, sizeof(buf), "Gain  %+.0f dB", (double)db);
         set_text(s_dGainLabel, buf);
     }
     if (s_dPanLabel) {
@@ -644,8 +645,9 @@ void open_detail(int idx)
     if (s_gainInput >= 0) {
         auto* g = gains();
         detail_line("", &s_dGainLabel);
-        const int32_t steps = (int32_t)lroundf(g->maxDb() / g->stepDb());
-        s_dGain = detail_slider(0, steps, (int32_t)lroundf(g->gainDb(s_gainInput) / g->stepDb()), color, gain_cb, nullptr);
+        const int32_t lo = (int32_t)lroundf(g->minDbOf(s_gainInput) / g->stepDb());
+        const int32_t hi = (int32_t)lroundf(g->maxDbOf(s_gainInput) / g->stepDb());
+        s_dGain = detail_slider(lo, hi, (int32_t)lroundf(g->gainDb(s_gainInput) / g->stepDb()), color, gain_cb, nullptr);
     }
     if (look && look->page == kIn) {
         /* Where it is heard, chosen outright: off, each output, all of them. */
@@ -827,7 +829,7 @@ constexpr int     kVisMax = kMaxRows > kMixerMaxChannels ? kMaxRows : kMixerMaxC
 
 const char* const kTabNames[kPages] = {"IN", "SOURCES", "OUT", "ROUTE", "PRESETS"};
 
-/// What each row's fader zone moves: the level (an input's GAIN) or the pan.
+/// What each row's fader zone moves: the level or the pan.
 uint8_t s_fpage[kPages] = {};
 int     s_vis[kVisMax];            // the rows on screen: s_rows indices, ROUTE's channel ids or preset slots
 int     s_nvis = 0;
@@ -870,8 +872,6 @@ float row_level(const Row& r)
     auto& m = getMixerEngine();
     if (r.level >= 0) return (float)output_levels()->level(r.level) / 100.0f;
     if (r.output) return gain_to_pos(m.getOutputVolume(r.id));
-    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
-    if (gi >= 0) return gains()->gainDb(gi) / gains()->maxDb();
     return gain_to_pos(m.getChannelVolume(r.id));
 }
 
@@ -881,26 +881,18 @@ void set_row_level(const Row& r, float k)
     auto& m = getMixerEngine();
     if (r.level >= 0) { output_levels()->setLevel(r.level, (int)lroundf(k * 100.0f)); return; }
     if (r.output) { m.setOutputVolume(r.id, pos_to_gain(k)); return; }
-    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
-    if (gi >= 0) {
-        auto* g = gains();
-        g->setGainDb(gi, lroundf(k * g->maxDb() / g->stepDb()) * g->stepDb());
-        return;
-    }
     m.setChannelVolume(r.id, pos_to_gain(k));
 }
 
-/// "GAIN +12 dB", "+0.0 dB", "80" -- what the level reads under the zone.
+/// "+0.0 dB", "80" -- what the level reads under the zone.
 void level_text(const Row& r, char* buf, size_t n)
 {
     auto& m = getMixerEngine();
     char db[12];
     if (r.level >= 0) { std::snprintf(buf, n, "%d", output_levels()->level(r.level)); return; }
     if (r.output) { db_text(db, sizeof(db), m.getOutputVolume(r.id)); std::snprintf(buf, n, "%s dB", db); return; }
-    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
-    if (gi >= 0) { std::snprintf(buf, n, "GAIN +%.0f dB", (double)gains()->gainDb(gi)); return; }
     db_text(db, sizeof(db), m.getChannelVolume(r.id));
-    std::snprintf(buf, n, "%s%s dB", r.page == kIn ? "GAIN " : "", db);
+    std::snprintf(buf, n, "%s dB", db);
 }
 
 /// Rows whose zone has a pan page: channels, not outputs.
@@ -1038,6 +1030,11 @@ void paint_fader_row(int vi)
     else if (r.output)                    set_text(r.sub, output_role(m.getOutputName(r.id)));
     else if (r.src >= 0)                  set_text(r.sub, idle ? "tap name: listen" : "listening");
     else if (!connected(r.id))            set_text(r.sub, "not in pair");
+    else if (s_page == kIn && gain_input_of(r.id) >= 0) {
+        /* The preamp, set in the window the name opens. */
+        std::snprintf(buf, sizeof(buf), "gain %+.0f dB", (double)gains()->gainDb(gain_input_of(r.id)));
+        set_text(r.sub, buf);
+    }
     else if (s_page == kSources || s_page == kIn) {
         pan_text(buf, sizeof(buf), m.getChannelPan(r.id));
         set_text(r.sub, buf);
@@ -1106,7 +1103,7 @@ const char* key_label(int k, char* buf, size_t n)
     auto* p = input_pairs();
     switch (s_page) {
         case kIn: {
-            static const char* const L[] = {"GAIN", "PAN", "RESET"};
+            static const char* const L[] = {"LEVEL", "PAN", "RESET"};
             if (k < 3) return L[k];
             if (p && p->pairs() >= 2) { std::snprintf(buf, n, "PAIR %s", p->pairName(p->pair())); return buf; }
             return nullptr;
@@ -1257,16 +1254,14 @@ void tab_cb(lv_event_t* e)
 }
 
 /// RESET on a fader section: the focused row's value on the page shown --
-/// unity (no gain on an input), or the centre.
+/// unity, or the centre.
 void reset_row(const Row& r)
 {
     auto& m = getMixerEngine();
     if (s_fpage[s_page] == 1 && has_pan(r)) { m.setChannelPan(r.id, 0.0f); return; }
     if (r.level >= 0) return;                    // the hardware's level has no unity
     if (r.output) { m.setOutputVolume(r.id, 1.0f); return; }
-    const int gi = r.page == kIn ? gain_input_of(r.id) : -1;
-    if (gi >= 0) gains()->setGainDb(gi, 0.0f);
-    else         m.setChannelVolume(r.id, 1.0f);
+    m.setChannelVolume(r.id, 1.0f);
 }
 
 void do_softkey(int k)
