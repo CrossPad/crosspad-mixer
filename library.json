@@ -16,7 +16,7 @@
         "espressif32"
     ],
     "dependencies": {
-        "crosspad-core": ">=2.34.0,<3.0.0",
+        "crosspad-core": ">=2.42.0,<3.0.0",
         "crosspad-gui": ">=1.28.0,<3.0.0"
     },
     "build": {

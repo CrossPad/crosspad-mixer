@@ -11,11 +11,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=2.34.0,<3.0.0",
+    "crosspad-core": ">=2.42.0,<3.0.0",
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
-    "0.20.0: an input row's fader is its channel's LEVEL, as a source's is; its gain shows under the name, and the name opens the window where GAIN is set, first and focused. The GAIN slider spans the input's own range (IInputGain::minDbOf()/maxDbOf(), core 2.34) and shows its sign: on the board a line input goes -24..+24 dB. Requires core 2.34.",
+    "0.20.0: an input row's fader is its channel's LEVEL, as a source's is; its gain shows under the name, and the name opens the window where GAIN is set, first and focused. The GAIN slider spans the input's own range (IInputGain::minDbOf()/maxDbOf(), core 2.42) and shows its sign: on the board a line input goes -24..+24 dB. Requires core 2.42.",
     "0.19.0: setChannelTapOnly() -- a channel rendered, metered and on the tap, sent to no output, never saved with the desk: a song's freeze that runs in real time records its engine without anyone hearing it",
     "0.18.0: setChannelTrimPan() -- a balance on top of a channel's own pan, never saved with the desk, as setChannelTrim() is to its fader: what an Arrange seq track's pan puts on the engine its notes play through while the song plays; the two multiply",
     "0.17.0: a node that says its block added nothing (core 2.16.0 IAudioNode::lastMixSilent()) is metered as silent without a pass over its block -- in render() and renderOnly(); the buses and meters are the same to the bit. Requires core 2.16.",
