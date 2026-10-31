@@ -2,32 +2,35 @@
  * @file MixerApp.cpp
  * @brief Mixer and signal router, sized for a finger.
  *
- * "Mixer ·" on "CrossPad UX2000 Touch.html": five tabs along the top, the
- * section's rows under them, the soft keys along the bottom.
+ * Five tabs along the top, the section under them, the soft keys along the
+ * bottom.
  *
  *   IN       what comes into the board: the mics, the line-in sockets, USB
- *            audio from the host. The zone is the channel's LEVEL (or PAN),
- *            its gain under the name -- the name opens it to set --, MON
- *            sends it to every output you hear, and an input with a choice of
- *            sockets has a row per socket and a key that listens to it. Where
- *            the board has more inputs than ADCs, PAIR picks the two it hears;
- *            the input left out stays on the desk, dimmed.
- *   SOURCES  what the board plays: LEVEL or PAN in the zone, M and S.
- *   OUT      the masters -- speakers, phones, the USB recording bus -- and a
- *            speaker or jack the hardware gives a level of its own: LEVEL, M,
- *            and LIM lit while the limiter works.
- *   ROUTE    which source and input goes to which output, a chip each; CLEAR
- *            and RESET (everything to what is heard).
+ *            audio from the host. A strip per input: its LEVEL (or PAN), its
+ *            gain under the name -- the name opens it to set --, MON sends it
+ *            to every output you hear, and an input with a choice of sockets
+ *            has a strip per socket and a key that listens to it. Where the
+ *            board has more inputs than ADCs, PAIR picks the two it hears; the
+ *            input left out stays on the desk, dimmed.
+ *   SOURCES  what the board plays: LEVEL or PAN, M and S.
+ *   OUT      the masters -- phones, line out, USB -- and a speaker or jack
+ *            the hardware gives a level of its own: LEVEL, M, and LIM lit
+ *            while the limiter works.
+ *   ROUTE    where every source and input goes: a row per channel, a column
+ *            per output named over it in its colour, and in each cell the
+ *            send's slider and level ("off" at the bottom); CLEAR and RESET
+ *            (everything to what is heard).
  *   PRESETS  the whole desk saved under a name, loaded back; UNDO puts back
  *            what a load replaced.
  *
- * A row: its name, a 152 px zone a finger drags (level, or pan on the PAN
- * page; the meter in it on IN and OUT), the value under it, two keys. Tap
- * the name for the rest of the channel: an input's gain, its sends, monitor, pan -- an
- * output's tone. The encoder turns the focused row and clicks to the next
- * one, past the last to the next section.
+ * A strip, as on a desk: the name and the line under it (a tap opens the rest
+ * of the channel: an input's gain, its sends, monitor, pan -- an output's
+ * tone), the fader up the strip with the meter beside its track (across the
+ * strip on the PAN page), the value, two keys. The encoder turns the focused
+ * strip (on ROUTE the framed send) and clicks to the next one, past the last
+ * to the next section.
  *
- * The engine is the only state: rows are painted from it every tick, so
+ * The engine is the only state: strips are painted from it every tick, so
  * anything else that moves the mix (HIL, a loaded state) shows up here. On
  * close the app asks the engine to persist (notifyStateChanged). The pads
  * keep playing the kit.
@@ -121,11 +124,31 @@ const Look* look_for(const char* name)
 const char* output_role(const char* name)
 {
     static const struct { const char* name; const char* role; } kRoles[] = {
-        {"Out 1/2", "speakers"},
-        {"Out 3/4", "phones"},
+        {"Out 1/2", "phones"},
+        {"Out 3/4", "line out"},
     };
     for (const auto& r : kRoles) if (std::strcmp(r.name, name) == 0) return r.role;
     return "master";
+}
+
+/// An output as ROUTE and the sends name it: what it is and its jack
+/// ("Phones 1/2", "Line out 3/4"), or its own name ("USB").
+void out_label(char* buf, size_t n, uint8_t o)
+{
+    const char* name = getMixerEngine().getOutputName(o);
+    const char* role = output_role(name);
+    if (std::strcmp(role, "master") == 0) { std::snprintf(buf, n, "%s", name); return; }
+    const char* sp = std::strrchr(name, ' ');
+    std::snprintf(buf, n, "%c%s %s", role[0] - 'a' + 'A', role + 1, sp ? sp + 1 : name);
+}
+
+/// Each output's colour, the same on ROUTE's columns and on its OUT strip.
+lv_color_t out_color(uint8_t o)
+{
+    const char* role = output_role(getMixerEngine().getOutputName(o));
+    if (std::strcmp(role, "phones") == 0) return lv_color_hex(0x4FE0B0);
+    if (std::strcmp(role, "line out") == 0) return lv_color_hex(0x4FC3F7);
+    return lv_color_hex(0xFFC857);
 }
 
 struct Row {
@@ -145,9 +168,11 @@ struct Row {
     lv_obj_t* name = nullptr;
     lv_obj_t* sub = nullptr;     // under the name: pan, the socket, the role
     lv_obj_t* zone = nullptr;    // the fader's touch zone
+    lv_obj_t* well = nullptr;    // the fader's track: up the strip, or across it for pan
     lv_obj_t* fill = nullptr;
     lv_obj_t* center = nullptr;  // the pan page's centre line
     lv_obj_t* meter = nullptr;
+    lv_obj_t* meterWell = nullptr;
     lv_obj_t* peakMark = nullptr;
     lv_obj_t* knob = nullptr;
     lv_obj_t* val = nullptr;     // under the zone: dB, gain, pan
@@ -430,8 +455,10 @@ void detail_labels()
     for (int i = 0; i < kMaxMonChoices; ++i) paint(s_dMon[i], s_dMon[i] && s_dMonMask[i] == mon, kAccent);
     for (int o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
         if (!s_dSendLabels[o]) continue;
-        if (!m.isRouteEnabled(r.id, o)) std::snprintf(buf, sizeof(buf), "%s  off", m.getOutputName(o));
-        else std::snprintf(buf, sizeof(buf), "%s  %d", m.getOutputName(o), (int)lroundf(m.getRouteVolume(r.id, o) * 100.0f));
+        char out[24];
+        out_label(out, sizeof(out), (uint8_t)o);
+        if (!m.isRouteEnabled(r.id, o)) std::snprintf(buf, sizeof(buf), "%s  off", out);
+        else std::snprintf(buf, sizeof(buf), "%s  %d", out, (int)lroundf(m.getRouteVolume(r.id, o) * 100.0f));
         set_text(s_dSendLabels[o], buf);
     }
 }
@@ -812,18 +839,28 @@ bool back_handler(lv_obj_t*)
     return false;
 }
 
-// ── the desk: tabs, rows, soft keys ────────────────────────────────────────
+// ── the desk: tabs, strips, soft keys ──────────────────────────────────────
 //
-// "Mixer ·" on "CrossPad UX2000 Touch.html", 320 x 200 under the transport
-// bar: the five tabs on top (59 x 36), the section's rows under them (312 x
-// 44, 4 apart, scrolling), three or four soft keys along the bottom (42 tall).
+// 320 x 200 under the transport bar: the five tabs on top (59 x 26), the
+// section under them (312 x 134), three or four soft keys along the bottom
+// (28 tall). IN, SOURCES and OUT are channel strips side by side (60 wide,
+// five to a screen, scrolling sideways); ROUTE and PRESETS are rows.
 
-constexpr int32_t kTabY  = 4,   kTabW = 59, kTabH = 36, kTabStep = 63;
-constexpr int32_t kListY = 44,  kListH = 106;
-constexpr int32_t kKeyY  = 154, kKeyH = 42;
-constexpr int32_t kRowW  = 312, kRowH = 44, kRowStep = 48;
-constexpr int32_t kZoneX = 84,  kZoneW = 152;          // the fader's touch zone
-constexpr int32_t kTogX  = 236, kTogW = 34, kTogStep = 38;
+constexpr int32_t kTabY  = 2,   kTabW = 59, kTabH = 26, kTabStep = 63;
+constexpr int32_t kListY = 32,  kListH = 134;
+constexpr int32_t kKeyY  = 170, kKeyH = 28;
+constexpr int32_t kRowW  = 312, kRowH = 44, kRowStep = 48;   // PRESETS
+/* A strip, top to bottom: the name and the line under it (a tap opens the
+ * channel), the fader with its meter beside the track, the value, two keys. */
+constexpr int32_t kStripW = 60, kStripStep = 63;
+constexpr int32_t kZoneY  = 32, kZoneH = 64;            // the fader's touch zone
+constexpr int32_t kTrackX = 22, kMeterX = 32;           // in the zone
+constexpr int32_t kPanX   = 4,  kPanW = kStripW - 8;    // the pan page's track
+constexpr int32_t kTogY   = kListH - 25, kTogH = 22;
+/* ROUTE: the outputs named over their columns, a row per channel, a send
+ * slider in every cell. */
+constexpr int32_t kHeadH  = 14;
+constexpr int32_t kRouteH = 38, kRouteStep = 42, kRouteNameW = 72;
 constexpr int     kKeys  = 4;
 constexpr int     kVisMax = kMaxRows > kMixerMaxChannels ? kMaxRows : kMixerMaxChannels;
 
@@ -834,11 +871,15 @@ uint8_t s_fpage[kPages] = {};
 int     s_vis[kVisMax];            // the rows on screen: s_rows indices, ROUTE's channel ids or preset slots
 int     s_nvis = 0;
 int     s_focus = 0;               // index into s_vis
+int     s_rcol = 0;                // ROUTE: the output column the encoder moves
 int     s_psel = 0;                // PRESETS: the slot the keys act on
 int     s_loaded = -1;             // PRESETS: the slot last loaded here
 lv_obj_t* s_list = nullptr;
+lv_obj_t* s_head = nullptr;        // ROUTE: the outputs over their columns
+lv_obj_t* s_fade = nullptr;        // a list's bottom edge, rows scrolling on under it
 lv_obj_t* s_keys[kKeys] = {};
 lv_obj_t* s_visRow[kVisMax] = {};  // each visible row's box
+/* ROUTE: each cell, the send's value (child 0) over its slider (child 1). */
 lv_obj_t* s_chips[kMixerMaxChannels][kMixerMaxOutputs] = {};
 lv_obj_t* s_rowSub[kVisMax] = {};  // ROUTE / PRESETS rows: the line under the name
 lv_obj_t* s_rowTag[kVisMax] = {};  // PRESETS: LOADED
@@ -955,7 +996,7 @@ void key_on(lv_obj_t* b, bool on, lv_color_t onCol, lv_color_t off = kText)
 lv_color_t row_color(const Row& r)
 {
     if (r.page == kIn) return kSky;
-    if (r.output) return kAccent;
+    if (r.output) return out_color(r.id);
     const Look* look = look_for(getMixerEngine().getChannelName(r.id));
     return look ? lv_color_hex(look->color) : kText;
 }
@@ -976,15 +1017,16 @@ void paint_row(int vi);
 void paint_keys();
 void build_section();
 
-/// A fader row: the zone's fill or pan, the knob, the value; the meter on the
-/// level page of IN and OUT; the two keys.
+/// A strip: the fader's fill and knob up the track (or the pan across the
+/// strip), the value; the meter beside the track on the level page of IN and
+/// OUT; the two keys.
 void paint_fader_row(int vi)
 {
     Row& r = s_rows[s_vis[vi]];
     if (!r.box) return;
     auto& m = getMixerEngine();
     const bool pan = s_fpage[s_page] == 1 && has_pan(r);
-    const bool meter = !pan && s_page != kSources;
+    const bool meter = !pan;            // beside the track, on every level page
     const bool idle = socket_idle(r) || !connected(r.id);
     bool muted = false, dimmed = idle;
     if (r.level >= 0) muted = output_levels()->muted(r.level);
@@ -997,36 +1039,46 @@ void paint_fader_row(int vi)
     lv_obj_set_style_text_color(r.name, dimmed ? kDim : kText, 0);
 
     char buf[24];
-    const int32_t mid = kZoneW / 2;
-    int32_t x;
     if (pan) {
         const float p = m.getChannelPan(r.id);
-        x = mid + (int32_t)lroundf(p * (float)mid);
+        const int32_t mid = kPanX + kPanW / 2, y = kZoneH / 2 - 2;
+        const int32_t x = mid + (int32_t)lroundf(p * (float)kPanW * 0.5f);
+        lv_obj_set_pos(r.well, kPanX, y);
+        lv_obj_set_size(r.well, kPanW, 4);
         lv_obj_remove_flag(r.center, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_x(r.fill, x < mid ? x : mid);
-        lv_obj_set_width(r.fill, x < mid ? mid - x : x - mid);
+        lv_obj_set_pos(r.fill, x < mid ? x : mid, y);
+        lv_obj_set_size(r.fill, x < mid ? mid - x : x - mid, 4);
+        lv_obj_set_size(r.knob, 10, 26);
+        lv_obj_set_pos(r.knob, x - 5, kZoneH / 2 - 13);
         pan_text(buf, sizeof(buf), p);
         set_text(r.val, buf + 4);                  // "pan L12" -> "L12"
     } else {
-        x = (int32_t)lroundf(row_level(r) * (float)kZoneW);
+        const int32_t y = kZoneH - (int32_t)lroundf(row_level(r) * (float)kZoneH);
+        lv_obj_set_pos(r.well, kTrackX, 0);
+        lv_obj_set_size(r.well, 4, kZoneH);
         lv_obj_add_flag(r.center, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_x(r.fill, 0);
-        lv_obj_set_width(r.fill, meter ? 0 : x);
+        lv_obj_set_pos(r.fill, kTrackX, y);
+        lv_obj_set_size(r.fill, 4, kZoneH - y);
+        lv_obj_set_size(r.knob, 30, 10);
+        lv_obj_set_pos(r.knob, kTrackX + 2 - 15, y - 5);
         level_text(r, buf, sizeof(buf));
         set_text(r.val, buf);
     }
     lv_obj_set_style_bg_color(r.fill, dimmed ? kDim : row_color(r), 0);
-    if (!lv_obj_has_state(r.zone, LV_STATE_PRESSED)) lv_obj_set_x(r.knob, x - 6);
-    if (meter) {
-        lv_obj_remove_flag(r.meter, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(r.peakMark, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(r.meter, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(r.peakMark, LV_OBJ_FLAG_HIDDEN);
+    /* The knob lights while a finger or the encoder has hold of it. */
+    bool held = lv_obj_has_state(r.zone, LV_STATE_PRESSED);
+#ifdef MIXER_USE_ENCODER
+    held = held || (s_encGroup && lv_group_get_editing(s_encGroup) && lv_group_get_focused(s_encGroup) == r.zone);
+#endif
+    const lv_color_t knob = held ? kAccent : kKnob;
+    if (!lv_color_eq(lv_obj_get_style_bg_color(r.knob, LV_PART_MAIN), knob)) lv_obj_set_style_bg_color(r.knob, knob, 0);
+    for (lv_obj_t* o : {r.meter, r.meterWell, r.peakMark}) {
+        if (meter) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else       lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
     }
 
     /* The line under the name: what the row is. */
-    if (r.level >= 0)                     set_text(r.sub, output_role(m.getOutputName(r.id)));
+    if (r.level >= 0)                     set_text(r.sub, m.getOutputName(r.id));
     else if (r.output)                    set_text(r.sub, output_role(m.getOutputName(r.id)));
     else if (r.src >= 0)                  set_text(r.sub, idle ? "tap name: listen" : "listening");
     else if (!connected(r.id))            set_text(r.sub, "not in pair");
@@ -1053,17 +1105,30 @@ void paint_fader_row(int vi)
     }
 }
 
+/// A ROUTE row: in every cell the send's slider, and over it "off" or its
+/// level in the output's colour; the cell the encoder moves framed.
 void paint_route_row(int vi)
 {
     lv_obj_t* box = s_visRow[vi];
     if (!box) return;
     auto& m = getMixerEngine();
     const uint8_t ch = (uint8_t)s_vis[vi];
-    lv_obj_set_style_border_width(box, vi == s_focus ? 2 : 0, 0);
     int n = 0;
     for (uint8_t o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) {
+        lv_obj_t* cell = s_chips[vi][o];
+        if (!cell) continue;
         const bool on = m.isRouteEnabled(ch, o);
-        key_on(s_chips[vi][o], on, kTeal);
+        const float vol = m.getRouteVolume(ch, o);
+        lv_obj_t* val = lv_obj_get_child(cell, 0);
+        lv_obj_t* s = lv_obj_get_child(cell, 1);
+        const int32_t v = on ? (int32_t)lroundf(vol * 100.0f) : 0;
+        if (!lv_obj_has_state(s, LV_STATE_PRESSED) && lv_slider_get_value(s) != v) lv_slider_set_value(s, v, LV_ANIM_OFF);
+        char buf[16], db[12];
+        if (on) { db_text(db, sizeof(db), vol); std::snprintf(buf, sizeof(buf), "%s dB", db); }
+        set_text(val, on ? buf : "off");
+        const lv_color_t ink = on ? out_color(o) : kDim;
+        if (!lv_color_eq(lv_obj_get_style_text_color(val, LV_PART_MAIN), ink)) lv_obj_set_style_text_color(val, ink, 0);
+        lv_obj_set_style_border_width(cell, vi == s_focus && o == s_rcol ? 2 : 0, 0);
         n += on;
     }
     char buf[12];
@@ -1165,17 +1230,18 @@ void focus_row(int vi, bool scroll)
 
 void zone_cb(lv_event_t* e)
 {
+    /* A finger; the encoder's press and turns are zone_enc_cb's. */
+    lv_indev_t* in = lv_indev_active();
+    if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_POINTER) return;
     const int vi = (int)(intptr_t)lv_event_get_user_data(e);
     Row& r = s_rows[s_vis[vi]];
     const lv_event_code_t code = lv_event_get_code(e);
     if (socket_idle(r) || !connected(r.id)) return;
     if (code == LV_EVENT_PRESSED) {
         s_focus = vi;
-        lv_obj_set_style_bg_color(r.knob, kAccent, 0);
         paint_all();
     }
     if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        lv_obj_set_style_bg_color(r.knob, kKnob, 0);
         paint_row(vi);
         return;
     }
@@ -1183,17 +1249,18 @@ void zone_cb(lv_event_t* e)
     lv_indev_get_point(lv_indev_active(), &p);
     lv_area_t a;
     lv_obj_get_coords(r.zone, &a);
-    float k = (float)(p.x - a.x1) / (float)kZoneW;
+    const bool pan = s_fpage[s_page] == 1 && has_pan(r);
+    /* The level runs up the strip, the pan across it. */
+    float k = pan ? (float)(p.x - a.x1 - kPanX) / (float)kPanW : (float)(a.y1 + kZoneH - p.y) / (float)kZoneH;
     k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
-    if (s_fpage[s_page] == 1 && has_pan(r)) {
-        float pan = k * 2.0f - 1.0f;
-        if (fabsf(pan) < 0.05f) pan = 0.0f;
-        getMixerEngine().setChannelPan(r.id, pan);
+    if (pan) {
+        float v = k * 2.0f - 1.0f;
+        if (fabsf(v) < 0.05f) v = 0.0f;
+        getMixerEngine().setChannelPan(r.id, v);
     } else {
-        if (fabsf(k - kUnityPos) < 0.02f && r.level < 0) k = kUnityPos;
+        if (fabsf(k - kUnityPos) < 0.03f && r.level < 0) k = kUnityPos;
         set_row_level(r, k);
     }
-    lv_obj_set_x(r.knob, (int32_t)(k * kZoneW) - 6);
     paint_row(vi);
 }
 
@@ -1230,18 +1297,34 @@ void row_name_cb(lv_event_t* e)
     paint_all();
 }
 
-void chip_cb(lv_event_t* e)
+/// A send slider on ROUTE: dragged, the send's level (to zero is off);
+/// pressed, the cell the encoder moves.
+void route_cb(lv_event_t* e)
 {
     const uint32_t d = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     const int vi = d & 0xFF;
-    const uint8_t o = (uint8_t)(d >> 8);
-    auto& m = getMixerEngine();
-    const uint8_t ch = (uint8_t)s_vis[vi];
-    const bool on = !m.isRouteEnabled(ch, o);
-    if (on && m.getRouteVolume(ch, o) <= 0.0f) m.setRouteVolume(ch, o, 1.0f);
-    m.setRouteEnabled(ch, o, on);
+    const int o = (int)(d >> 8);
+    if (vi >= s_nvis || !s_chips[vi][o]) return;
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        set_send((uint8_t)s_vis[vi], o, lv_slider_get_value(lv_obj_get_child(s_chips[vi][o], 1)));
+    }
+    const int was = s_focus;
     s_focus = vi;
-    paint_all();
+    s_rcol = o;
+    if (was != vi) paint_route_row(was);
+    paint_route_row(vi);
+}
+
+/// ROUTE's encoder: a turn moves the framed send by 5.
+void route_turn(int d)
+{
+    if (s_focus >= s_nvis) return;
+    auto& m = getMixerEngine();
+    const uint8_t ch = (uint8_t)s_vis[s_focus];
+    int32_t v = m.isRouteEnabled(ch, s_rcol) ? (int32_t)lroundf(m.getRouteVolume(ch, s_rcol) * 100.0f) : 0;
+    v += d * 5;
+    set_send(ch, s_rcol, v < 0 ? 0 : (v > 100 ? 100 : v));
+    paint_route_row(s_focus);
 }
 
 void preset_row_cb(lv_event_t* e) { focus_row((int)(intptr_t)lv_event_get_user_data(e), false); }
@@ -1250,6 +1333,7 @@ void tab_cb(lv_event_t* e)
 {
     s_page = (Page)(intptr_t)lv_event_get_user_data(e);
     s_focus = 0;
+    s_rcol = 0;
     build_section();
 }
 
@@ -1323,21 +1407,25 @@ void do_softkey(int k)
 
 void softkey_cb(lv_event_t* e) { do_softkey((int)(intptr_t)lv_event_get_user_data(e)); }
 
-/// The encoder: turned, the focused row's value (a preset: the selection);
-/// clicked, the next row, and past the last, the next section.
-void root_key_cb(lv_event_t* e)
+/// The encoder on a fader: a click takes it into editing (the knob lights)
+/// and out again; while editing, a turn moves the level -- or the pan on the
+/// PAN page.
+void zone_enc_cb(lv_event_t* e)
 {
-    const uint32_t key = lv_event_get_key(e);
-    const int d = (key == LV_KEY_RIGHT || key == LV_KEY_UP) ? 1 : (key == LV_KEY_LEFT || key == LV_KEY_DOWN) ? -1 : 0;
-    if (!d || !s_nvis) return;
-    if (s_page == kPresets || s_page == kRoute) {
-        int f = s_focus + d;
-        f = f < 0 ? 0 : (f >= s_nvis ? s_nvis - 1 : f);
-        focus_row(f, true);
+    const int vi = (int)(intptr_t)lv_event_get_user_data(e);
+    if (vi >= s_nvis) return;
+    Row& r = s_rows[s_vis[vi]];
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        lv_indev_t* in = lv_indev_active();
+        lv_group_t* g = lv_obj_get_group(r.zone);
+        if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_ENCODER || !g) return;
+        lv_group_set_editing(g, !lv_group_get_editing(g));
+        paint_row(vi);
         return;
     }
-    Row& r = s_rows[s_vis[s_focus]];
-    if (socket_idle(r) || !connected(r.id)) return;
+    const uint32_t key = lv_event_get_key(e);
+    const int d = (key == LV_KEY_RIGHT || key == LV_KEY_UP) ? 1 : (key == LV_KEY_LEFT || key == LV_KEY_DOWN) ? -1 : 0;
+    if (!d || socket_idle(r) || !connected(r.id)) return;
     if (s_fpage[s_page] == 1 && has_pan(r)) {
         float p = getMixerEngine().getChannelPan(r.id) + (float)d * 0.02f;
         getMixerEngine().setChannelPan(r.id, p < -1.0f ? -1.0f : (p > 1.0f ? 1.0f : p));
@@ -1346,36 +1434,65 @@ void root_key_cb(lv_event_t* e)
         const float step = r.level >= 0 ? 0.01f : (gi >= 0 ? gains()->stepDb() / gains()->maxDb() : 0.01f);
         set_row_level(r, row_level(r) + (float)d * step);
     }
-    paint_row(s_focus);
+    paint_row(vi);
 }
 
-void root_click_cb(lv_event_t*)
+/// A send slider being edited: a turn moves it by 5, not LVGL's 1.
+void route_key_cb(lv_event_t* e)
 {
-    lv_indev_t* in = lv_indev_active();
-    if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_ENCODER) return;
-    if (s_page == kPresets) {
-        do_softkey(0);                             // a click loads the selection
-        return;
-    }
-    if (s_focus + 1 < s_nvis) { focus_row(s_focus + 1, true); return; }
-    s_page = (Page)((s_page + 1) % kPages);
-    s_focus = 0;
-    build_section();
+    const uint32_t key = lv_event_get_key(e);
+    const int d = (key == LV_KEY_RIGHT || key == LV_KEY_UP) ? 1 : (key == LV_KEY_LEFT || key == LV_KEY_DOWN) ? -1 : 0;
+    if (!d) return;
+    const uint32_t ud = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    s_focus = ud & 0xFF;
+    s_rcol = (int)(ud >> 8);
+    route_turn(d);
+    lv_event_stop_processing(e);
+}
+
+/// The encoder's focus on anything of a strip or a row frames that strip
+/// (on ROUTE, that send).
+void focus_cb(lv_event_t* e)
+{
+    const uint32_t ud = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const int vi = ud & 0xFF;
+    if (vi >= s_nvis) return;
+    s_focus = vi;
+    if (s_page == kRoute) s_rcol = (int)(ud >> 8);
+    if (s_page == kPresets) s_psel = vi;
+    paint_all();
+}
+
+/// @p o into the encoder's ring, in the order it is called: the tabs, the
+/// section left to right and top to bottom, the soft keys.
+void enc_add(lv_obj_t* o, void* focusUd = nullptr, bool framed = false)
+{
+#ifdef MIXER_USE_ENCODER
+    if (!s_encGroup || !o) return;
+    lv_group_add_obj(s_encGroup, o);
+    lv_obj_set_style_outline_color(o, kFocus, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(o, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_pad(o, 1, LV_STATE_FOCUS_KEY);
+    if (framed) lv_obj_add_event_cb(o, focus_cb, LV_EVENT_FOCUSED, focusUd);
+#else
+    (void)o; (void)focusUd; (void)framed;
+#endif
 }
 
 // ── building a section ─────────────────────────────────────────────────────
 
-lv_obj_t* row_base(int vi, lv_color_t stripe, const char* name, lv_obj_t** nameOut, lv_obj_t** subOut)
+lv_obj_t* row_base(int vi, int32_t h, int32_t step, lv_color_t stripe, const char* name, lv_obj_t** nameOut,
+                   lv_obj_t** subOut)
 {
-    lv_obj_t* b = plain(s_list, 0, vi * kRowStep, kRowW, kRowH, 6, kRowBg);
+    lv_obj_t* b = plain(s_list, 0, vi * step, kRowW, h, 6, kRowBg);
     lv_obj_set_style_clip_corner(b, true, 0);
     lv_obj_set_style_border_color(b, kAccent, 0);
-    plain(b, 0, 0, 4, kRowH, 0, stripe);
-    lv_obj_t* n = text(b, &lv_font_montserrat_14, kText, 12, 7, name);
-    lv_obj_set_width(n, 72);
+    plain(b, 0, 0, 4, h, 0, stripe);
+    lv_obj_t* n = text(b, &lv_font_montserrat_14, kText, 10, 4, name);
+    lv_obj_set_width(n, kRouteNameW - 12);
     lv_label_set_long_mode(n, LV_LABEL_LONG_CLIP);
-    lv_obj_t* s = text(b, &lv_font_montserrat_10, kDim, 12, 26, "");
-    lv_obj_set_width(s, 72);
+    lv_obj_t* s = text(b, &lv_font_montserrat_10, kDim, 10, h - 16, "");
+    lv_obj_set_width(s, kRouteNameW - 12);
     lv_label_set_long_mode(s, LV_LABEL_LONG_CLIP);
     if (nameOut) *nameOut = n;
     if (subOut) *subOut = s;
@@ -1383,45 +1500,75 @@ lv_obj_t* row_base(int vi, lv_color_t stripe, const char* name, lv_obj_t** nameO
     return b;
 }
 
+/// A label across a strip, centred and clipped to it.
+lv_obj_t* strip_text(lv_obj_t* b, const lv_font_t* f, lv_color_t c, int32_t y, const char* t)
+{
+    lv_obj_t* l = text(b, f, c, 2, y, t);
+    lv_obj_set_width(l, kStripW - 4);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+    return l;
+}
+
 void build_fader_row(int vi, Row& r)
 {
-    lv_obj_t* b = row_base(vi, row_color(r), row_name(r), &r.name, &r.sub);
+    lv_obj_t* b = plain(s_list, vi * kStripStep, 0, kStripW, kListH, 6, kRowBg);
+    lv_obj_set_style_clip_corner(b, true, 0);
+    lv_obj_set_style_border_color(b, kAccent, 0);
+    plain(b, 0, 0, kStripW, 3, 0, row_color(r));
+    s_visRow[vi] = b;
     r.box = b;
+    const char* name = row_name(r);
+    /* 14 px where the name fits the strip, 10 where it does not. */
+    const bool fits = lv_text_get_width(name, (uint32_t)std::strlen(name), &lv_font_montserrat_14, 0) <= kStripW - 4;
+    r.name = strip_text(b, fits ? &lv_font_montserrat_14 : &lv_font_montserrat_10, kText, 6, name);
+    r.sub = strip_text(b, &lv_font_montserrat_10, kDim, 21, "");
     /* The name opens the rest of the channel (its sends, its tone). */
-    lv_obj_t* hit = plain(b, 0, 0, kZoneX, kRowH, 0, kRowBg, LV_OPA_TRANSP);
+    lv_obj_t* hit = plain(b, 0, 0, kStripW, kZoneY, 0, kRowBg, LV_OPA_TRANSP);
     lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(hit, row_name_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)vi);
+    enc_add(hit, (void*)(intptr_t)vi, true);
 
-    r.zone = plain(b, kZoneX, 0, kZoneW, kRowH, 0, kRowBg, LV_OPA_TRANSP);
+    /* The fader: the level up the track, the meter beside it; a drag on it
+     * never scrolls the strips sideways. */
+    r.zone = plain(b, 0, kZoneY, kStripW, kZoneH, 0, kRowBg, LV_OPA_TRANSP);
     lv_obj_add_flag(r.zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(r.zone, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
     lv_obj_remove_flag(r.zone, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
     for (lv_event_code_t c : {LV_EVENT_PRESSED, LV_EVENT_PRESSING, LV_EVENT_RELEASED, LV_EVENT_PRESS_LOST}) {
         lv_obj_add_event_cb(r.zone, zone_cb, c, (void*)(intptr_t)vi);
     }
-    plain(r.zone, 0, 18, kZoneW, 4, 2, kWell);
-    r.meter = plain(r.zone, 0, 18, 0, 4, 2, kWave);
-    lv_obj_set_style_bg_grad_color(r.meter, kMute, 0);
-    lv_obj_set_style_bg_grad_dir(r.meter, LV_GRAD_DIR_HOR, 0);
-    lv_obj_set_style_bg_main_stop(r.meter, 170, 0);
-    lv_obj_set_style_bg_grad_stop(r.meter, 255, 0);
-    r.peakMark = plain(r.zone, 0, 15, 2, 10, 0, kText);
-    r.center = plain(r.zone, kZoneW / 2 - 1, 13, 2, 14, 1, kDim);
-    r.fill = plain(r.zone, 0, 18, 0, 4, 2, row_color(r));
-    r.knob = plain(r.zone, 0, 6, 12, 28, 4, kKnob);
+    lv_obj_add_event_cb(r.zone, zone_enc_cb, LV_EVENT_CLICKED, (void*)(intptr_t)vi);
+    lv_obj_add_event_cb(r.zone, zone_enc_cb, LV_EVENT_KEY, (void*)(intptr_t)vi);
+    enc_add(r.zone, (void*)(intptr_t)vi, true);
+    r.well = plain(r.zone, kTrackX, 0, 4, kZoneH, 2, kWell);
+    r.meterWell = plain(r.zone, kMeterX, 0, 4, kZoneH, 2, kWell);
+    r.meter = plain(r.zone, kMeterX, kZoneH, 4, 0, 2, kMute);
+    lv_obj_set_style_bg_grad_color(r.meter, kWave, 0);
+    lv_obj_set_style_bg_grad_dir(r.meter, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_main_stop(r.meter, 0, 0);
+    lv_obj_set_style_bg_grad_stop(r.meter, 85, 0);
+    r.peakMark = plain(r.zone, kMeterX - 2, kZoneH, 8, 2, 0, kText);
+    r.center = plain(r.zone, kStripW / 2 - 1, kZoneH / 2 - 7, 2, 14, 1, kDim);
+    r.fill = plain(r.zone, kTrackX, kZoneH, 4, 0, 2, row_color(r));
+    r.knob = plain(r.zone, kTrackX + 2 - 15, kZoneH - 5, 30, 10, 3, kKnob);
     lv_obj_set_style_shadow_width(r.knob, 3, 0);
     lv_obj_set_style_shadow_opa(r.knob, LV_OPA_50, 0);
     lv_obj_set_style_shadow_offset_y(r.knob, 1, 0);
-    r.val = text(r.zone, &lv_font_montserrat_10, kDim, 0, 31, "");
+    r.val = strip_text(b, &lv_font_montserrat_10, kDim, kZoneY + kZoneH + 1, "");
 
     /* IN: MON, and the socket where the input has a choice of them;
      * SOURCES: M S; OUT: M and the limiter's light. */
     const char* k0 = s_page == kIn ? "MON" : "M";
     const char* k1 = s_page == kSources ? "S" : (s_page == kOut ? "LIM" : nullptr);
     if (s_page == kIn && r.src >= 0) k1 = gains()->sourceName(gain_input_of(r.id), r.src);
-    r.k[0] = key(b, kTogX, 4, kTogW, 36, k0, tog_cb, (void*)(uintptr_t)(vi | (0 << 8)));
-    r.k[1] = k1 ? key(b, kTogX + kTogStep, 4, kTogW, 36, k1, s_page == kOut ? nullptr : tog_cb,
+    const int32_t kw = k1 ? (kStripW - 6) / 2 : kStripW - 4;
+    r.k[0] = key(b, 2, kTogY, kw, kTogH, k0, tog_cb, (void*)(uintptr_t)(vi | (0 << 8)));
+    r.k[1] = k1 ? key(b, 4 + kw, kTogY, kw, kTogH, k1, s_page == kOut ? nullptr : tog_cb,
                       (void*)(uintptr_t)(vi | (1 << 8)))
                 : nullptr;
+    enc_add(r.k[0], (void*)(intptr_t)vi, true);
+    if (r.k[1] && s_page != kOut) enc_add(r.k[1], (void*)(intptr_t)vi, true);
 }
 
 void build_route_row(int vi, uint8_t ch)
@@ -1429,14 +1576,40 @@ void build_route_row(int vi, uint8_t ch)
     auto& m = getMixerEngine();
     const Look* look = look_for(m.getChannelName(ch));
     const lv_color_t col = look && look->page == kIn ? kSky : (look ? lv_color_hex(look->color) : kText);
-    lv_obj_t* b = row_base(vi, col, look ? look->label : m.getChannelName(ch), nullptr, &s_rowSub[vi]);
+    lv_obj_t* b = row_base(vi, kRouteH, kRouteStep, col, look ? look->label : m.getChannelName(ch), nullptr,
+                           &s_rowSub[vi]);
     const int n = m.numOutputs() < kMixerMaxOutputs ? m.numOutputs() : kMixerMaxOutputs;
-    const int32_t w = (kRowW - kZoneX - 4 - (n - 1) * 4) / (n ? n : 1);
+    const int32_t w = (kRowW - kRouteNameW - 4 - (n - 1) * 4) / (n ? n : 1);
     for (int o = 0; o < n; ++o) {
-        char name[8];
-        short_output_name(name, sizeof(name), (uint8_t)o);
-        s_chips[vi][o] = key(b, kZoneX + o * (w + 4), 4, w, 36, name, chip_cb,
-                             (void*)(uintptr_t)(vi | (o << 8)));
+        lv_obj_t* cell = plain(b, kRouteNameW + o * (w + 4), 3, w, kRouteH - 6, 4, kWell);
+        lv_obj_set_style_border_color(cell, out_color((uint8_t)o), 0);
+        text(cell, &lv_font_montserrat_10, kDim, 5, 1, "off");
+        void* ud = (void*)(uintptr_t)(vi | (o << 8));
+        lv_obj_t* s = make_slider(cell, 0, 100, out_color((uint8_t)o), route_cb, ud);
+        lv_obj_set_pos(s, 6, 16);
+        lv_obj_set_width(s, w - 12);
+        lv_obj_add_event_cb(s, route_cb, LV_EVENT_PRESSED, ud);
+        lv_obj_add_event_cb(s, route_key_cb, (lv_event_code_t)(LV_EVENT_KEY | LV_EVENT_PREPROCESS), ud);
+        enc_add(s, ud, true);
+        s_chips[vi][o] = cell;
+    }
+}
+
+/// ROUTE's head: every output's name over its column, in its colour.
+void build_route_head()
+{
+    lv_obj_clean(s_head);
+    auto& m = getMixerEngine();
+    const int n = m.numOutputs() < kMixerMaxOutputs ? m.numOutputs() : kMixerMaxOutputs;
+    const int32_t w = (kRowW - kRouteNameW - 4 - (n - 1) * 4) / (n ? n : 1);
+    text(s_head, &lv_font_montserrat_10, kDim, 10, 0, "SEND TO");
+    for (int o = 0; o < n; ++o) {
+        char name[24];
+        out_label(name, sizeof(name), (uint8_t)o);
+        lv_obj_t* l = text(s_head, &lv_font_montserrat_10, out_color((uint8_t)o), kRouteNameW + o * (w + 4), 0, name);
+        lv_obj_set_width(l, w);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
     }
 }
 
@@ -1447,6 +1620,7 @@ void build_preset_row(int vi)
     lv_obj_set_style_border_color(b, kTeal, 0);
     lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(b, preset_row_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)vi);
+    enc_add(b, (void*)(intptr_t)vi, true);
     plain(b, 4, 12, 3, 20, 2, kAccent, i.kind == crosspad::MixerPresets::Kind::Saved ? LV_OPA_COVER : LV_OPA_30);
     text(b, &lv_font_montserrat_16, kText, 14, 6, i.name.c_str());
     s_rowSub[vi] = text(b, &lv_font_montserrat_10, kDim, 14, 27,
@@ -1462,8 +1636,17 @@ void build_preset_row(int vi)
 
 void build_section()
 {
+#ifdef MIXER_USE_ENCODER
+    /* The ring is rebuilt with the section: the tabs, the section, the keys. */
+    if (s_encGroup) {
+        lv_group_remove_all_objs(s_encGroup);
+        lv_group_set_editing(s_encGroup, false);
+    }
+#endif
+    for (lv_obj_t* t : s_tabs) enc_add(t);
     for (auto& r : s_rows) {
-        r.box = r.name = r.sub = r.zone = r.fill = r.center = r.meter = r.peakMark = r.knob = r.val = nullptr;
+        r.box = r.name = r.sub = r.zone = r.well = r.fill = r.center = r.meter = r.meterWell = r.peakMark = r.knob =
+            r.val = nullptr;
         r.k[0] = r.k[1] = nullptr;
     }
     for (auto& v : s_visRow) v = nullptr;
@@ -1471,8 +1654,21 @@ void build_section()
     for (auto& v : s_rowTag) v = nullptr;
     for (auto& row : s_chips) for (auto& c : row) c = nullptr;
     lv_obj_clean(s_list);
-    lv_obj_scroll_to_y(s_list, 0, LV_ANIM_OFF);
     s_nvis = 0;
+    /* Strips scroll sideways; ROUTE's and PRESETS' rows down, ROUTE's under
+     * the head naming its columns. */
+    const bool strips = fader_page(s_page);
+    const int32_t head = s_page == kRoute ? kHeadH : 0;
+    lv_obj_set_pos(s_list, 4, kListY + head);
+    lv_obj_set_size(s_list, kRowW, kListH - head);
+    lv_obj_set_scroll_dir(s_list, strips ? LV_DIR_HOR : LV_DIR_VER);
+    lv_obj_set_scroll_snap_x(s_list, strips ? LV_SCROLL_SNAP_START : LV_SCROLL_SNAP_NONE);
+    lv_obj_set_scroll_snap_y(s_list, strips ? LV_SCROLL_SNAP_NONE : LV_SCROLL_SNAP_START);
+    lv_obj_scroll_to(s_list, 0, 0, LV_ANIM_OFF);
+    if (strips) lv_obj_add_flag(s_fade, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_remove_flag(s_fade, LV_OBJ_FLAG_HIDDEN);
+    if (s_page == kRoute) { lv_obj_remove_flag(s_head, LV_OBJ_FLAG_HIDDEN); build_route_head(); }
+    else                  lv_obj_add_flag(s_head, LV_OBJ_FLAG_HIDDEN);
 
     if (fader_page(s_page)) {
         for (int i = 0; i < s_rowCount && s_nvis < kVisMax; ++i) {
@@ -1503,6 +1699,10 @@ void build_section()
         s_focus = s_psel;
     }
     if (s_focus >= s_nvis) s_focus = 0;
+    for (lv_obj_t* k : s_keys) enc_add(k);
+#ifdef MIXER_USE_ENCODER
+    if (s_encGroup) lv_group_focus_obj(s_tabs[s_page]);
+#endif
     paint_all();
     if (s_nvis && s_visRow[s_focus]) lv_obj_scroll_to_view(s_visRow[s_focus], LV_ANIM_OFF);
 }
@@ -1531,8 +1731,10 @@ void tick_cb(lv_timer_t*)
             r.shown = peak > r.shown ? peak : r.shown * 0.82f;
             r.peakHold = peak > r.peakHold ? peak : r.peakHold * 0.95f;
             if (r.meter && !lv_obj_has_flag(r.meter, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_set_width(r.meter, peak_to_meter(r.shown) * kZoneW / 100);
-                lv_obj_set_x(r.peakMark, peak_to_meter(r.peakHold) * kZoneW / 100 - 1);
+                const int32_t h = peak_to_meter(r.shown) * kZoneH / 100;
+                lv_obj_set_pos(r.meter, kMeterX, kZoneH - h);
+                lv_obj_set_height(r.meter, h);
+                lv_obj_set_y(r.peakMark, kZoneH - peak_to_meter(r.peakHold) * kZoneH / 100 - 1);
             }
             paint_fader_row(vi);
         }
@@ -1554,8 +1756,6 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_bg_color(s_root, kBg, 0);
     lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(s_root, root_key_cb, LV_EVENT_KEY, nullptr);
-    lv_obj_add_event_cb(s_root, root_click_cb, LV_EVENT_CLICKED, nullptr);
 
     for (int t = 0; t < kPages; ++t) {
         s_tabs[t] = key(s_root, 4 + t * kTabStep, kTabY, kTabW, kTabH, kTabNames[t], tab_cb, (void*)(intptr_t)t);
@@ -1564,17 +1764,16 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     }
     s_list = lv_obj_create(s_root);
     lv_obj_remove_style_all(s_list);
-    lv_obj_set_pos(s_list, 4, kListY);
-    lv_obj_set_size(s_list, kRowW, kListH);
-    lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_scroll_snap_y(s_list, LV_SCROLL_SNAP_START);
-    /* A fade along the list's bottom: rows scroll on under it. */
-    lv_obj_t* fade = plain(s_root, 0, kListY + kListH - 14, 320, 14, 0, kBg);
-    lv_obj_set_style_bg_main_opa(fade, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_bg_grad_color(fade, kBg, 0);
-    lv_obj_set_style_bg_grad_opa(fade, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_grad_dir(fade, LV_GRAD_DIR_VER, 0);
+    s_head = make_box(s_root);
+    lv_obj_set_pos(s_head, 4, kListY);
+    lv_obj_set_size(s_head, kRowW, kHeadH);
+    /* A fade along a list's bottom: rows scroll on under it. */
+    s_fade = plain(s_root, 0, kListY + kListH - 14, 320, 14, 0, kBg);
+    lv_obj_set_style_bg_main_opa(s_fade, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_grad_color(s_fade, kBg, 0);
+    lv_obj_set_style_bg_grad_opa(s_fade, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_grad_dir(s_fade, LV_GRAD_DIR_VER, 0);
     for (int k = 0; k < kKeys; ++k) s_keys[k] = key(s_root, 4, kKeyY, 100, kKeyH, "", softkey_cb, (void*)(intptr_t)k);
 
     /* The channels in the order kLooks gives them -- the inputs, then the
@@ -1630,6 +1829,13 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
         if (!hw) add_row(true, o, kOut, -1, -1);
     }
 
+#ifdef MIXER_USE_ENCODER
+    /* The encoder walks everything on the desk, as everywhere: a turn moves
+     * the focus, a click presses a key or takes a fader or a send into
+     * editing, where a turn moves it and a click lets go. */
+    if (indev_encoderTop) s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
+    if (!s_encGroup) s_encGroup = lv_group_create();
+#endif
     s_page = kSources;
     s_focus = 0;
     s_psel = 0;
@@ -1637,14 +1843,6 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
 #ifdef MIXER_USE_ENCODER
-    /* The desk takes the encoder in edit mode: a turn moves the focused
-     * row's value, a click the focus. A long press lets go -- the transport
-     * bar's keys are one turn on. */
-    if (indev_encoderTop) s_prevEncGroup = lv_indev_get_group(indev_encoderTop);
-    if (!s_encGroup) s_encGroup = lv_group_create();
-    lv_group_add_obj(s_encGroup, s_root);
-    lv_group_focus_obj(s_root);
-    lv_group_set_editing(s_encGroup, true);
     if (indev_encoderTop) lv_indev_set_group(indev_encoderTop, s_encGroup);
 #endif
 
@@ -1698,7 +1896,7 @@ void Mixer_destroy(lv_obj_t* app_obj)
     for (auto& t : s_tabs) t = nullptr;
     for (auto& k : s_keys) k = nullptr;
     s_rowCount = s_sourceCount = s_nvis = 0;
-    s_root = s_list = nullptr;
+    s_root = s_list = s_head = s_fade = nullptr;
 
 #ifdef MIXER_USE_ENCODER
     if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);

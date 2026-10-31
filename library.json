@@ -1,6 +1,6 @@
 {
     "name": "crosspad-mixer",
-    "version": "0.20.0",
+    "version": "0.21.0",
     "license": "GPL-3.0-or-later",
     "description": "CrossPad audio mixer/router with VU meters, routing matrix, channel strips",
     "keywords": [
