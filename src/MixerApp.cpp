@@ -1520,7 +1520,11 @@ void build_fader_row(int vi, Row& r)
     r.box = b;
     const char* name = row_name(r);
     /* 14 px where the name fits the strip, 10 where it does not. */
-    const bool fits = lv_text_get_width(name, (uint32_t)std::strlen(name), &lv_font_montserrat_14, 0) <= kStripW - 4;
+    /* lv_text_get_size: public with this signature on LVGL 9.3 (board) and
+     * 9.4+ (simulator); lv_text_get_width went private in 9.4. */
+    lv_point_t nameSize;
+    lv_text_get_size(&nameSize, name, &lv_font_montserrat_14, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    const bool fits = nameSize.x <= kStripW - 4;
     r.name = strip_text(b, fits ? &lv_font_montserrat_14 : &lv_font_montserrat_10, kText, 6, name);
     r.sub = strip_text(b, &lv_font_montserrat_10, kDim, 21, "");
     /* The name opens the rest of the channel (its sends, its tone). */
