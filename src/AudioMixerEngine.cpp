@@ -43,7 +43,7 @@ static constexpr float kLimReleaseS = 0.2f;
 /* How long the gain stays where a peak put it before letting go at all. Per
  * block, a release between the crests of one loud note and a cut back at the
  * next crest moves the gain with the waveform -- the limiter turned into a
- * waveshaper, heard as drive. Modelled block for block (10.10.2026): a 40 Hz
+ * waveshaper, heard as drive. Modelled block for block: a 40 Hz
  * sine 6 dB over the ceiling came out at THD -36 dB, -77 dB with this hold;
  * 60 Hz + 7 kHz IMD -40 -> -57 dB. Longer than a 20 Hz period. */
 static constexpr float kLimHoldS = 0.05f;
@@ -481,7 +481,7 @@ float AudioMixerEngine::takeOutputLimit(OutputId out) {
  * voices at unity and a fader goes to +6 dB. Sixteen pads at once put 1.66 on
  * the Sampler2 channel, so with the output fader near 0 dB the clamp in
  * render() cut the tops off -- heard as distortion -- and the pads tap, with
- * no fader at all, wrote it into every bounce and take (09.10.2026).
+ * no fader at all, wrote it into every bounce and take.
  *
  * Per block, which the render has whole before any of it leaves: the gain
  * comes down to what the block's peak allows and goes back towards unity
@@ -538,7 +538,7 @@ bool AudioMixerEngine::limit(float* buf, uint32_t frames, float ceiling, float& 
 /* limit() a block late. Coming down within the frames before a peak is a step
  * when the peak is near the start of a block -- and on the USB recording bus,
  * with no fader in front of it, a chord in 16 levels of pitch put one there on
- * every hit: lim 0.367, clicks in the take and none on the jacks (10.10.2026).
+ * every hit: lim 0.367, clicks in the take and none on the jacks.
  *
  * Here what leaves is the block held back, and the one coming in is known, so
  * the gain reaches what both need by the end of the outgoing block, in one
