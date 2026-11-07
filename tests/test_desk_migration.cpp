@@ -10,7 +10,7 @@
 /* A desk saved by one build loaded by another whose channels sit in other
  * slots. The case that made this matter: the native sampler engine's
  * "Sampler2" channel went in after "Pitched", so on a build with it USB,
- * Click and the inputs are each one slot later than on main / wifi-remote,
+ * Click and the inputs are each one slot later than on a build without it,
  * and a build without the prebuilt engine has one "Sampler" (the native
  * engine) and no "Sampler2". */
 
@@ -29,11 +29,10 @@ public:
 
 constexpr uint8_t kOuts = 3;
 
-/* main and feat/wifi-remote: CrosspadPlatform.cpp's order before the native
- * engine. */
+/* CrosspadPlatform.cpp's order before the native engine. */
 const std::vector<const char*> kMainLayout = {"Sampler", "Pitched", "USB", "Click",
                                               "IN1", "IN2", "IN3"};
-/* integrate/native-engine-wifi with the prebuilt engine built in. */
+/* A build with the prebuilt engine built in beside the native one. */
 const std::vector<const char*> kTwoEngineLayout = {"Sampler", "Pitched", "Sampler2", "USB",
                                                    "Click", "IN1", "IN2", "IN3"};
 
@@ -156,7 +155,7 @@ TEST_CASE("before the migration, by slot, the shifted channels lost their settin
 }
 
 TEST_CASE("a desk saved by the two-engine build loads onto the one-engine build", "[desk]") {
-    /* Steve's builds played the native engine on "Sampler2"; "Sampler" was
+    /* The two-engine builds played the native engine on "Sampler2"; "Sampler" was
      * the prebuilt streamer's. The one-engine image's "Sampler" *is* the
      * native engine, so it takes Sampler2's settings, and the streamer's are
      * dropped -- not the other way round. */

@@ -262,7 +262,7 @@ public:
     /// Apply a string from stateJson(), of this version or an older one.
     /// Each saved channel goes to the live channel of the same name wherever
     /// it now sits, so a build that inserts a channel (the native sampler's
-    /// "Sampler2", 2026-10) or drops one loads an older desk onto the right
+    /// "Sampler2") or drops one loads an older desk onto the right
     /// channels instead of shifting them. False when it does not parse, in
     /// which case nothing is changed.
     bool applyStateJson(const std::string& json);
@@ -271,7 +271,7 @@ public:
     /// 5: a desk older than this onto a build with one sample engine gets
     /// that engine rescued once if it would load silent -- muted, at zero,
     /// or sent only to outputs nobody hears -- because 4 had already put the
-    /// unused streamer's settings on it and saved them (2026-10-09).
+    /// unused streamer's settings on it and saved them.
     static constexpr int kDeskVersion = 5;
     /// The last applyStateJson() loaded a desk older than kDeskVersion: the
     /// platform saves it back once, so a rescue is not repeated on every boot

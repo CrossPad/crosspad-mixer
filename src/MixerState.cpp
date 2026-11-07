@@ -29,8 +29,8 @@
  *     a desk from before it gave nothing to any of them (the name guard
  *     refused every one) -- and a build without the channel would shift them
  *     back the other way.
- *  3. A channel that was only renamed (kRenamed, either way round: main's
- *     IN1/IN2 and Steve's Mic/Line are the same jacks): the channel with the
+ *  3. A channel that was only renamed (kRenamed, either way round: IN1/IN2
+ *     and Mic/Line are the same jacks): the channel with the
  *     other name, its saved slot first.
  *  4. A saved entry with no name (nothing written so far does that) or a
  *     saved slot nobody has registered yet: the saved slot, as before.
@@ -144,7 +144,7 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
 
     /* A desk of a two-engine build (the prebuilt streamer on "Sampler", the
      * native engine on "Sampler2") onto a build with only the native one,
-     * which is called "Sampler". What was heard there was Sampler2 -- Steve's
+     * which is called "Sampler". What was heard there was Sampler2 -- those
      * builds played it -- so its settings are the ones this build's Sampler
      * gets, and the streamer's (often muted, being unused) are dropped. By
      * name alone it went the other way: the streamer's mute on the only
@@ -245,7 +245,7 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
 
     /* Said, not changed: an input that loads sent to an output is a live
      * microphone or line on the speakers from boot, which is how a noise
-     * floor nobody asked for reaches a recording (rt_glitch, 2026-10-09). */
+     * floor nobody asked for reaches a recording. */
     static const char* const kInputs[] = {"IN1", "IN2", "IN3", "Mic", "Line"};
     for (int ch = 0; ch < kMixerMaxChannels; ++ch) {
         const auto& in = channels_[ch];

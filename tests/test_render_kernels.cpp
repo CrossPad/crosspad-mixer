@@ -12,7 +12,7 @@
  * replaced: the same buses, the same meters, the same limiter, block after
  * block -- on the host, where nothing fuses a multiply-add, bit for bit. Those
  * loops left core once the board had chosen; what they rendered is kept as
- * the digest of this script's output, recorded through them (16.10.2026). */
+ * the digest of this script's output, recorded through them. */
 
 namespace {
 
