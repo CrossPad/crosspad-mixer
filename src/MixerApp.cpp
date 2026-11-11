@@ -39,6 +39,7 @@
 #include "crosspad-mixer/MixerApp.hpp"
 #include "crosspad-mixer/AudioMixerEngine.hpp"
 #include "crosspad-mixer/MixerPresets.hpp"
+#include "crosspad-mixer/OutputLimitTick.hpp"
 
 #if __has_include("pc_stubs/PcApp.hpp")
   #include "pc_stubs/PcApp.hpp"
@@ -1719,12 +1720,15 @@ void tick_cb(lv_timer_t*)
 {
     auto& m = getMixerEngine();
     if (fader_page(s_page)) {
+        /* One bus can be several rows (Speakers and Phones on Out 1/2): the
+         * limiter's reading is taken once per bus and lights all of them. */
+        OutputLimitTick limit(m);
         for (int vi = 0; vi < s_nvis; ++vi) {
             Row& r = s_rows[s_vis[vi]];
             float l = 0.0f, rr = 0.0f;
             if (r.output || r.level >= 0) {
                 m.getOutputLevel(r.id, l, rr);
-                if (m.takeOutputLimit(r.id) < 0.99f) r.limitLit = 20;   // a second at 50 ms
+                if (limit(r.id) < 0.99f) r.limitLit = 20;   // a second at 50 ms
                 else if (r.limitLit) --r.limitLit;
             } else if (!socket_idle(r)) {
                 m.getChannelLevel(r.id, l, rr);
