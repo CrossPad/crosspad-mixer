@@ -1,7 +1,7 @@
 {
   "name": "Mixer",
   "id": "mixer",
-  "version": "0.21.1",
+  "version": "0.21.2",
   "description": "Audio mixer/router — dynamic IAudioNode channels, multi-output routing",
   "category": "audio",
   "icon": "mixer.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.21.2: a preset LOAD or UNDO takes away an output EQ the desk it restores did not have; before, a preset saved flat or the UNDO of a load left the EQ that was on still on while the toast said the desk was back as it was.",
     "0.21.1: a strip's name is measured with lv_text_get_size, so the Mixer builds on the simulator's LVGL 9.4 as well as the board's 9.3; nothing changes on screen.",
     "0.21.0: back to channel strips side by side on IN, SOURCES and OUT -- the fader up the strip with its meter beside the track (on every level page), the pan across it on the PAN page, five strips to a screen, scrolling sideways -- and ROUTE a send slider in every cell, the outputs named over their columns in their colours (Phones 1/2, Line out 3/4, USB), 'off' or the level in dB over each. The encoder walks every element (tabs, a strip's name, fader and keys, every send, the soft keys): a turn moves the focus, a click presses a key or takes a fader or a send into editing, where a turn moves it (a send by 5) and a click lets go.",
     "0.20.0: an input row's fader is its channel's LEVEL, as a source's is; its gain shows under the name, and the name opens the window where GAIN is set, first and focused. The GAIN slider spans the input's own range (IInputGain::minDbOf()/maxDbOf(), core 2.42) and shows its sign: on the board a line input goes -24..+24 dB. Requires core 2.42.",

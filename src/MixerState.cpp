@@ -271,8 +271,19 @@ bool AudioMixerEngine::applyStateJson(const std::string& json) {
         }
         /* Only a desk that has an EQ in it asks for one: an EQ's state is
          * taken on first use, and a board that has never set one should not
-         * pay for it at boot. */
-        if (!ob["eq"].is<JsonArrayConst>() && !(ob["eqOn"] | false)) { ++idx; continue; }
+         * pay for it at boot. A desk without one still means "no EQ" though:
+         * stateJson() leaves a flat, off EQ out, so a preset or the UNDO
+         * snapshot of a desk that had none must take away the EQ that is on
+         * now. settings() takes nothing, so an output that has never had an
+         * EQ still costs nothing here. */
+        if (!ob["eq"].is<JsonArrayConst>() && !(ob["eqOn"] | false)) {
+            if (idx < kMixerEqOutputs) {
+                const crosspad::EqSettings cur = outputEq_[idx].settings();
+                if (cur.on || cur.any()) outputEq_[idx].set(crosspad::EqSettings{});
+            }
+            ++idx;
+            continue;
+        }
         crosspad::EqSettings eq;
         eq.on = ob["eqOn"] | false;
         int bi = 0;
