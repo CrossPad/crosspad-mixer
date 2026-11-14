@@ -83,6 +83,10 @@ CP_COLD void AudioMixerEngine::setup(uint32_t frameCount, uint32_t sampleRate, u
     for (auto& o : outputs_) {
         if (o.lookahead.load(std::memory_order_relaxed)) o.held.assign(stereoSamples, 0.0f);
     }
+    if (crosspad::IAudioNode* fx = fx_.load(std::memory_order_acquire)) {
+        if (fxBus_.size() < stereoSamples) fxBus_.resize(stereoSamples);
+        fx->onPrepare(frameCount, sampleRate);
+    }
 
     limRelease_ = sampleRate ? 1.0f - std::exp(-(float)frameCount / ((float)sampleRate * kLimReleaseS))
                              : 1.0f;
@@ -318,6 +322,44 @@ void AudioMixerEngine::setChannelSolo(ChannelId ch, bool soloed) {
 bool AudioMixerEngine::isChannelSoloed(ChannelId ch) const {
     if (ch >= kMixerMaxChannels) return false;
     return channels_[ch].soloed.load(std::memory_order_relaxed);
+}
+
+// ── FX bus ─────────────────────────────────────────────────────────────────
+
+CP_COLD void AudioMixerEngine::setFxProcessor(crosspad::IAudioNode* fx) {
+    if (fx) {
+        /* Sized and prepared before the render can see it. */
+        const uint32_t stereoSamples = frameCount_ * 2;
+        if (fxBus_.size() < stereoSamples) fxBus_.resize(stereoSamples);
+        if (frameCount_ && sampleRate_) fx->onPrepare(frameCount_, sampleRate_);
+    }
+    fx_.store(fx, std::memory_order_release);
+}
+
+void AudioMixerEngine::setFxSend(ChannelId ch, float level) {
+    if (ch >= kMixerMaxChannels) return;
+    channels_[ch].fxSend.store(level < 0.0f ? 0.0f : level, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getFxSend(ChannelId ch) const {
+    return ch < kMixerMaxChannels ? channels_[ch].fxSend.load(std::memory_order_relaxed) : 0.0f;
+}
+
+void AudioMixerEngine::setFxPreFader(bool pre) { fxPre_.store(pre, std::memory_order_relaxed); }
+bool AudioMixerEngine::isFxPreFader() const { return fxPre_.load(std::memory_order_relaxed); }
+
+void AudioMixerEngine::setFxReturn(OutputId out, float level) {
+    if (out >= kMixerMaxOutputs) return;
+    fxReturn_[out].store(level < 0.0f ? 0.0f : level, std::memory_order_relaxed);
+}
+
+float AudioMixerEngine::getFxReturn(OutputId out) const {
+    return out < kMixerMaxOutputs ? fxReturn_[out].load(std::memory_order_relaxed) : 0.0f;
+}
+
+void AudioMixerEngine::getFxLevel(float& left, float& right) const {
+    left = fxPeakL_.load(std::memory_order_relaxed);
+    right = fxPeakR_.load(std::memory_order_relaxed);
 }
 
 bool AudioMixerEngine::isAnySoloed() const {
@@ -683,6 +725,10 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
     // float, and its two passes -- a product into a scratch, then a sum --
     // read and wrote every sample three times where this does it once.
     const uint32_t cRoute0 = prof ? cyc_() : 0;
+    crosspad::IAudioNode* const fx = fx_.load(std::memory_order_acquire);
+    float* const fxBus = fx && fxBus_.size() >= stereo ? fxBus_.data() : nullptr;
+    const bool fxPre = fxPre_.load(std::memory_order_relaxed);
+    if (fxBus) std::memset(fxBus, 0, stereo * sizeof(float));
     for (uint8_t ch = 0; ch < kMixerMaxChannels; ++ch) {
         auto& slot = channels_[ch];
         if (!slot.active.load(std::memory_order_acquire) || !slot.node) continue;
@@ -717,6 +763,22 @@ void AudioMixerEngine::render(float* const* outBuses, uint8_t numOut, uint32_t f
             if (!slot.routeEnabled[o].load(std::memory_order_relaxed)) continue;
             const float gain = chVol * slot.routeVol[o].load(std::memory_order_relaxed);
             crosspad::dsp::mac(outBuses[o], src, gain, stereo);
+        }
+        const float send = slot.fxSend.load(std::memory_order_relaxed);
+        if (fxBus && send > 0.0f) crosspad::dsp::mac(fxBus, src, fxPre ? send : chVol * send, stereo);
+    }
+
+    /* The FX bus: processed in place, then onto the outputs it returns to,
+     * before their volume and limiter. */
+    if (fxBus) {
+        if (fx->enabled()) fx->process(fxBus, fxBus, frames);
+        float pL = 0.0f, pR = 0.0f;
+        crosspad::dsp::peakStereo(fxBus, frames, pL, pR);
+        fxPeakL_.store(pL, std::memory_order_relaxed);
+        fxPeakR_.store(pR, std::memory_order_relaxed);
+        for (uint8_t o = 0; o < numOut; ++o) {
+            const float r = fxReturn_[o].load(std::memory_order_relaxed);
+            if (r > 0.0f) crosspad::dsp::mac(outBuses[o], fxBus, r, stereo);
         }
     }
 
