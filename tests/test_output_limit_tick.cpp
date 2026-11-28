@@ -8,7 +8,7 @@
 
 /* The OUT page shows Out 1/2 as two rows, Speakers and Phones. Both must light
  * LIM from one tick's limiter reading: takeOutputLimit() resets what it reads,
- * so a take per row left the second row dark (crosspad-mixer, Mixer 0.21.3). */
+ * so a take per row left the second row dark (crosspad-mixer, Mixer 0.22.1). */
 
 namespace {
 
@@ -74,4 +74,34 @@ TEST_CASE("OutputLimitTick: the reading is taken once, the next tick starts fres
     OutputLimitTick limit(d.eng);
     const float a = limit(0);
     REQUIRE(limit(0) == a);
+}
+
+/* The reading keeps the deepest limiting since the last read, and nothing reads
+ * it while no page shows the outputs: entering OUT on a silent desk lit LIM for
+ * a second from music played minutes before (board, v1.1.5-rc1). */
+TEST_CASE("discardOutputLimits: limiting from before the page was shown lights nothing", "[limit]")
+{
+    Desk d;
+    d.block();                                   // loud, with the page closed
+    d.node.level = 0.0f;
+    for (int i = 0; i < 2000; ++i) d.block();    // silence since: the gain is back at 1
+    { OutputLimitTick stale(d.eng); REQUIRE(stale(0) < 0.99f); }   // the bug: still reported
+
+    d.node.level = 1.6f;
+    d.block();
+    d.node.level = 0.0f;
+    for (int i = 0; i < 2000; ++i) d.block();
+    discardOutputLimits(d.eng);                  // the page is entered
+    OutputLimitTick first(d.eng);
+    REQUIRE(first(0) == 1.0f);
+    REQUIRE(first(1) == 1.0f);
+}
+
+TEST_CASE("discardOutputLimits: limiting after the page is entered still shows", "[limit]")
+{
+    Desk d;
+    discardOutputLimits(d.eng);
+    d.block();
+    OutputLimitTick limit(d.eng);
+    REQUIRE(limit(0) < 0.99f);
 }

@@ -167,6 +167,31 @@ public:
     bool  isChannelTapOnly (ChannelId ch) const;
     bool  isAnySoloed     () const;
 
+    // ── FX bus ─────────────────────────────────────────────────────────────
+    //
+    // One insert bus beside the outputs: channels send to it, a processor (an
+    // IAudioNode, process() in place) runs over the sum in the same render
+    // pass, and its result is added to the outputs it returns to before
+    // their volume and limiter -- no block of latency. The processor runs
+    // every block once set, sound or not, so a delay or a reverb rings out.
+    // A send is taken after the channel's fader, trim and pan; pre-fader
+    // (setFxPreFader) after its pan only. A muted channel sends nothing.
+    // Nothing of it is saved with the desk: it belongs to the app that sets
+    // the processor. Not from the render thread.
+    /// The processor, prepared here for the current block and rate; null
+    /// takes it away. A render pass already running may finish its block on
+    /// the one it replaced, so a processor lives as long as the firmware
+    /// (a static), never freed after it is taken away.
+    void  setFxProcessor(crosspad::IAudioNode* fx);
+    void  setFxSend     (ChannelId ch, float level);   ///< 0 = not sent
+    float getFxSend     (ChannelId ch) const;
+    void  setFxPreFader (bool pre);
+    bool  isFxPreFader  () const;
+    void  setFxReturn   (OutputId out, float level);   ///< 0 = not returned
+    float getFxReturn   (OutputId out) const;
+    /// The processor's output, the last block's peak a side.
+    void  getFxLevel    (float& left, float& right) const;
+
     // ── Output bus control ─────────────────────────────────────────────────
 
     void  setOutputVolume(OutputId out, float vol);
@@ -333,6 +358,7 @@ private:
         std::atomic<float> pan{0.0f};
         std::atomic<float> trimPan{0.0f};
         std::atomic<bool>  tapOnly{false};
+        std::atomic<float> fxSend{0.0f};
         std::atomic<float> peakL{0.0f};
         std::atomic<float> peakR{0.0f};
 
@@ -381,6 +407,15 @@ private:
 
     ChannelSlot channels_[kMixerMaxChannels];
     OutputSlot  outputs_[kMixerMaxOutputs];
+
+    /* The FX bus: the processor and its sum, sized with the channels'
+     * scratch once a processor is set; the returns a level per output. */
+    std::atomic<crosspad::IAudioNode*> fx_{nullptr};
+    std::atomic<bool>                  fxPre_{false};
+    std::atomic<float>                 fxReturn_[kMixerMaxOutputs] = {};
+    std::atomic<float>                 fxPeakL_{0.0f};
+    std::atomic<float>                 fxPeakR_{0.0f};
+    crosspad::dsp::AlignedVector<float> fxBus_;
     /* One per output that can be EQ'd -- the ones a board plays through, not
      * all eight slots. Internal RAM on this hardware is counted in hundreds
      * of bytes at boot (see EqChain), and an EQ across a recording bus is

@@ -37,3 +37,13 @@ private:
     uint32_t taken_ = 0;
     float    lim_[kMixerMaxOutputs] = {};
 };
+
+/// Throws away what every output bus's limiter gathered while nothing read it.
+/// takeOutputLimit() keeps the deepest gain since the last read, and only a
+/// page that shows the outputs reads it: without this, the first tick after
+/// the page appears lights LIM from music played minutes before, on a silent
+/// desk. Call it when a page is entered, before its first tick.
+inline void discardOutputLimits(AudioMixerEngine& m)
+{
+    for (uint8_t o = 0; o < m.numOutputs() && o < kMixerMaxOutputs; ++o) (void)m.takeOutputLimit(o);
+}

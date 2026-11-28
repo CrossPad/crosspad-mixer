@@ -1330,11 +1330,21 @@ void route_turn(int d)
 
 void preset_row_cb(lv_event_t* e) { focus_row((int)(intptr_t)lv_event_get_user_data(e), false); }
 
+/// Before a page's first tick: the limiter's reading holds the deepest
+/// limiting since it was last read, and only a shown output strip reads it,
+/// so what gathered meanwhile (and a light left half-way) is old news.
+void enter_page()
+{
+    discardOutputLimits(getMixerEngine());
+    for (int i = 0; i < s_rowCount; ++i) s_rows[i].limitLit = 0;
+}
+
 void tab_cb(lv_event_t* e)
 {
     s_page = (Page)(intptr_t)lv_event_get_user_data(e);
     s_focus = 0;
     s_rcol = 0;
+    enter_page();
     build_section();
 }
 
@@ -1847,6 +1857,7 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     s_page = kSources;
     s_focus = 0;
     s_psel = 0;
+    enter_page();
     build_section();
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
