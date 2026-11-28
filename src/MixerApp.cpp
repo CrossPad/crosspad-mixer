@@ -39,6 +39,7 @@
 #include "crosspad-mixer/MixerApp.hpp"
 #include "crosspad-mixer/AudioMixerEngine.hpp"
 #include "crosspad-mixer/MixerPresets.hpp"
+#include "crosspad-mixer/OutputLimitTick.hpp"
 
 #if __has_include("pc_stubs/PcApp.hpp")
   #include "pc_stubs/PcApp.hpp"
@@ -1329,11 +1330,21 @@ void route_turn(int d)
 
 void preset_row_cb(lv_event_t* e) { focus_row((int)(intptr_t)lv_event_get_user_data(e), false); }
 
+/// Before a page's first tick: the limiter's reading holds the deepest
+/// limiting since it was last read, and only a shown output strip reads it,
+/// so what gathered meanwhile (and a light left half-way) is old news.
+void enter_page()
+{
+    discardOutputLimits(getMixerEngine());
+    for (int i = 0; i < s_rowCount; ++i) s_rows[i].limitLit = 0;
+}
+
 void tab_cb(lv_event_t* e)
 {
     s_page = (Page)(intptr_t)lv_event_get_user_data(e);
     s_focus = 0;
     s_rcol = 0;
+    enter_page();
     build_section();
 }
 
@@ -1719,12 +1730,15 @@ void tick_cb(lv_timer_t*)
 {
     auto& m = getMixerEngine();
     if (fader_page(s_page)) {
+        /* One bus can be several rows (Speakers and Phones on Out 1/2): the
+         * limiter's reading is taken once per bus and lights all of them. */
+        OutputLimitTick limit(m);
         for (int vi = 0; vi < s_nvis; ++vi) {
             Row& r = s_rows[s_vis[vi]];
             float l = 0.0f, rr = 0.0f;
             if (r.output || r.level >= 0) {
                 m.getOutputLevel(r.id, l, rr);
-                if (m.takeOutputLimit(r.id) < 0.99f) r.limitLit = 20;   // a second at 50 ms
+                if (limit(r.id) < 0.99f) r.limitLit = 20;   // a second at 50 ms
                 else if (r.limitLit) --r.limitLit;
             } else if (!socket_idle(r)) {
                 m.getChannelLevel(r.id, l, rr);
@@ -1843,6 +1857,7 @@ lv_obj_t* Mixer_create(lv_obj_t* parent, App* app)
     s_page = kSources;
     s_focus = 0;
     s_psel = 0;
+    enter_page();
     build_section();
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
